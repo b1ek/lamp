@@ -18,6 +18,12 @@ const ICON_LABEL_GAP: f32 = BASE_FONT * 0.5;
 const BATTERY_FONT: f32 = BASE_FONT * 2.0;
 const BATTERY_PERCENTAGE_FONT: f32 = BATTERY_FONT * 0.7;
 const BATTERY_ICON_ASPECT: f32 = 6.0 / 3.175;
+const BATTERY_LEFT_NUDGE: f32 = 1.0;
+const BATTERY_BODY_UNITS: f32 = 5.2;
+const BATTERY_NUB_GAP: f32 = 2.0;
+const BATTERY_NUB_WIDTH: f32 = 13.0;
+
+const CONTENT_PADDING: f32 = 2.0;
 
 #[derive(PartialEq, Clone, Copy)]
 pub enum Page {
@@ -61,7 +67,18 @@ struct ButtonSpec {
     trailing: Option<String>,
 }
 
-pub fn draw(
+pub fn content_size(display: &Display, scale: f32, text: &mut Text) -> (f32, f32) {
+    let clock_width = text.run_width(&display.time, CLOCK_FONT * scale, CLOCK_LETTER_SPACING * scale);
+    let row_width = button_row(display, scale, text).1;
+    let padding = CONTENT_PADDING * scale;
+
+    let width = clock_width.max(row_width) + padding * 2.0;
+    let height = (CLOCK_FONT * LINE_HEIGHT + BASE_FONT * LINE_HEIGHT) * scale + padding * 2.0;
+
+    snap_to_scale((width, height), scale)
+}
+
+pub fn draw_content(
     canvas: &mut Canvas,
     display: &Display,
     sun: &SunTimes,
@@ -69,12 +86,12 @@ pub fn draw(
     scale: f32,
     text: &mut Text,
 ) {
-    let logical = (canvas.width as f32 / scale, canvas.height as f32 / scale);
     let background = background_at(sun, milliseconds_into_day);
     let ink = difference(background, text_color_at(sun, milliseconds_into_day));
 
     canvas.clear(background);
 
+    let padding = CONTENT_PADDING * scale;
     let clock_size = CLOCK_FONT * scale;
     let clock_line_height = clock_size * LINE_HEIGHT;
     let clock_spacing = CLOCK_LETTER_SPACING * scale;
@@ -84,26 +101,106 @@ pub fn draw(
         canvas,
         &display.time,
         (canvas.width as f32 - clock_width) / 2.0,
-        text.baseline(block_top(logical) * scale, clock_line_height, clock_size),
+        text.baseline(padding, clock_line_height, clock_size),
         clock_size,
         clock_spacing,
         ink,
     );
 
-    for button in buttons(display, logical, scale, text) {
-        draw_button(canvas, &button, scale, text, ink);
-    }
+    let (buttons, row_width) = button_row(display, scale, text);
+    let row_top = padding + clock_line_height;
+    let mut pen = (canvas.width as f32 - row_width) / 2.0;
 
-    if let Some(percentage) = display.battery {
-        draw_battery(canvas, percentage, scale, text, ink);
+    for button in &buttons {
+        draw_button(canvas, button, row_top, pen, scale, text, ink);
+        pen += button.rect.width + GAP * scale;
     }
 }
 
-pub fn action_at(display: &Display, logical: (f32, f32), point: (f32, f32), text: &mut Text) -> Option<Action> {
-    buttons(display, logical, 1.0, text)
-        .into_iter()
-        .find(|button| button.rect.contains(point.0, point.1))
-        .map(|button| button.action)
+pub fn action_at(display: &Display, point: (f32, f32), text: &mut Text) -> Option<Action> {
+    let (buttons, row_width) = button_row(display, 1.0, text);
+    let row_top = CONTENT_PADDING + CLOCK_FONT * LINE_HEIGHT;
+    let content_width = text.run_width(&display.time, CLOCK_FONT, CLOCK_LETTER_SPACING).max(row_width)
+        + CONTENT_PADDING * 2.0;
+    let mut pen = (content_width - row_width) / 2.0;
+
+    for button in buttons {
+        let rect = Rect::new(pen, row_top, button.rect.width, button.rect.height);
+
+        if rect.contains(point.0, point.1) {
+            return Some(button.action);
+        }
+
+        pen += button.rect.width + GAP;
+    }
+
+    None
+}
+
+pub fn battery_size(display: &Display, scale: f32, text: &mut Text) -> Option<(f32, f32)> {
+    let percentage = display.battery?;
+    let battery_font = BATTERY_FONT * scale;
+    let label = format!("{}%", percentage);
+    let label_width = text.run_width(&label, BATTERY_PERCENTAGE_FONT * scale, 0.0);
+    let padding = CONTENT_PADDING * scale;
+
+    let unit = battery_font / (BATTERY_ICON_ASPECT * 3.175);
+    let icon_left = battery_font + BATTERY_LEFT_NUDGE;
+    let nub_right = icon_left + BATTERY_BODY_UNITS * unit + BATTERY_NUB_GAP + BATTERY_NUB_WIDTH;
+    let label_right = icon_left + battery_font + battery_font * 0.3 + label_width;
+
+    let width = nub_right.max(label_right) + padding * 2.0;
+    let height = battery_font + battery_font * 0.5 + padding * 2.0;
+
+    Some(snap_to_scale((width, height), scale))
+}
+
+pub fn draw_battery(
+    canvas: &mut Canvas,
+    display: &Display,
+    sun: &SunTimes,
+    milliseconds_into_day: f64,
+    scale: f32,
+    text: &mut Text,
+) {
+    let Some(percentage) = display.battery else {
+        return;
+    };
+
+    let background = background_at(sun, milliseconds_into_day);
+    let ink = difference(background, text_color_at(sun, milliseconds_into_day));
+
+    canvas.clear(background);
+
+    let battery_font = BATTERY_FONT * scale;
+    let container = Rect::new(
+        battery_font + BATTERY_LEFT_NUDGE,
+        canvas.height as f32 - battery_font * 0.5 - battery_font,
+        battery_font,
+        battery_font,
+    );
+    let icon = Rect::new(
+        container.x,
+        container.y + (container.height - container.width / BATTERY_ICON_ASPECT) / 2.0,
+        container.width,
+        container.width / BATTERY_ICON_ASPECT,
+    );
+
+    draw_battery_icon(canvas, icon, percentage, ink);
+
+    let percentage_font = BATTERY_PERCENTAGE_FONT * scale;
+    let label = format!("{}%", percentage);
+    let line_height = percentage_font * LINE_HEIGHT;
+
+    text.draw_run(
+        canvas,
+        &label,
+        container.right() + battery_font * 0.3,
+        text.baseline(container.y + (container.height - line_height) / 2.0, line_height, percentage_font),
+        percentage_font,
+        0.0,
+        ink,
+    );
 }
 
 pub fn is_night(sun: &SunTimes, milliseconds_into_day: f64) -> bool {
@@ -132,19 +229,19 @@ pub fn background_at(sun: &SunTimes, milliseconds_into_day: f64) -> Color {
     NIGHT_COLOR
 }
 
+fn snap_to_scale(size: (f32, f32), scale: f32) -> (f32, f32) {
+    let width = (size.0 / scale).ceil() * scale;
+    let height = (size.1 / scale).ceil() * scale;
+
+    (width, height)
+}
+
 fn text_color_at(sun: &SunTimes, milliseconds_into_day: f64) -> Color {
     if is_night(sun, milliseconds_into_day) {
         NIGHT_TEXT_COLOR
     } else {
         DAY_TEXT_COLOR
     }
-}
-
-fn block_top(logical: (f32, f32)) -> f32 {
-    let clock_line_height = CLOCK_FONT * LINE_HEIGHT;
-    let row_height = BASE_FONT * LINE_HEIGHT;
-
-    (logical.1 - clock_line_height - row_height) / 2.0
 }
 
 fn day_color() -> Color {
@@ -190,45 +287,37 @@ fn kelvin_to_rgb(kelvin: f64) -> Color {
     [red, green, blue].map(|value| value.clamp(0.0, 255.0).round() as u8)
 }
 
-fn buttons(display: &Display, logical: (f32, f32), scale: f32, text: &mut Text) -> Vec<Button> {
-    let specs = page_buttons(display);
-    let row_height = BASE_FONT * LINE_HEIGHT;
-    let row_top = block_top(logical) + CLOCK_FONT * LINE_HEIGHT;
-
-    let mut measured: Vec<(ButtonSpec, f32)> = specs
+fn button_row(display: &Display, scale: f32, text: &mut Text) -> (Vec<Button>, f32) {
+    let measured: Vec<(ButtonSpec, f32)> = page_buttons(display)
         .into_iter()
         .map(|spec| {
-            let label_width = text.run_width(spec.label, BASE_FONT, 0.0);
+            let label_width = text.run_width(spec.label, BASE_FONT * scale, 0.0);
             let trailing_width = spec
                 .trailing
                 .as_deref()
-                .map(|run| text.run_width(run, BASE_FONT, 0.0))
+                .map(|run| text.run_width(run, BASE_FONT * scale, 0.0))
                 .unwrap_or(0.0);
 
-            (spec, BASE_FONT + ICON_LABEL_GAP + label_width + trailing_width)
+            let width = (BASE_FONT + ICON_LABEL_GAP) * scale + label_width + trailing_width;
+            (spec, width)
         })
         .collect();
 
-    let total_width: f32 =
-        measured.iter().map(|(_, width)| *width).sum::<f32>() + GAP * measured.len().saturating_sub(1) as f32;
+    let total_width: f32 = measured.iter().map(|(_, width)| *width).sum::<f32>()
+        + GAP * scale * measured.len().saturating_sub(1) as f32;
 
-    let mut pen = (logical.0 - total_width) / 2.0;
-
-    measured
-        .drain(..)
-        .map(|(spec, width)| {
-            let rect = Rect::new(pen * scale, row_top * scale, width * scale, row_height * scale);
-            pen += width + GAP;
-
-            Button {
-                rect,
-                action: spec.action,
-                icon: spec.icon,
-                label: spec.label,
-                trailing: spec.trailing,
-            }
+    let buttons = measured
+        .into_iter()
+        .map(|(spec, width)| Button {
+            rect: Rect::new(0.0, 0.0, width, BASE_FONT * LINE_HEIGHT * scale),
+            action: spec.action,
+            icon: spec.icon,
+            label: spec.label,
+            trailing: spec.trailing,
         })
-        .collect()
+        .collect();
+
+    (buttons, total_width)
 }
 
 fn page_buttons(display: &Display) -> Vec<ButtonSpec> {
@@ -262,21 +351,16 @@ fn page_buttons(display: &Display) -> Vec<ButtonSpec> {
     }
 }
 
-fn draw_button(canvas: &mut Canvas, button: &Button, scale: f32, text: &mut Text, ink: Color) {
+fn draw_button(canvas: &mut Canvas, button: &Button, row_top: f32, pen: f32, scale: f32, text: &mut Text, ink: Color) {
     let icon_size = BASE_FONT * scale;
-    let icon = Rect::new(
-        button.rect.x,
-        button.rect.y + (button.rect.height - icon_size) / 2.0,
-        icon_size,
-        icon_size,
-    );
+    let icon = Rect::new(pen, row_top + (button.rect.height - icon_size) / 2.0, icon_size, icon_size);
 
     match button.icon {
         Icon::Power => draw_power_icon(canvas, icon, ink),
         Icon::Back => draw_back_icon(canvas, icon, ink),
     }
 
-    let baseline = text.baseline(button.rect.y, button.rect.height, BASE_FONT * scale);
+    let baseline = text.baseline(row_top, button.rect.height, BASE_FONT * scale);
     let label_end = text.draw_run(
         canvas,
         button.label,
@@ -292,44 +376,15 @@ fn draw_button(canvas: &mut Canvas, button: &Button, scale: f32, text: &mut Text
     }
 }
 
-fn draw_battery(canvas: &mut Canvas, percentage: u8, scale: f32, text: &mut Text, ink: Color) {
-    let battery_font = BATTERY_FONT * scale;
-    let container = Rect::new(
-        battery_font + 1.0,
-        canvas.height as f32 - battery_font * 0.5 - battery_font,
-        battery_font,
-        battery_font,
-    );
-    let icon = Rect::new(
-        container.x,
-        container.y + (container.height - container.width / BATTERY_ICON_ASPECT) / 2.0,
-        container.width,
-        container.width / BATTERY_ICON_ASPECT,
-    );
-
-    let percentage = 100;
-
-    draw_battery_icon(canvas, icon, percentage, ink);
-
-    let percentage_font = BATTERY_PERCENTAGE_FONT * scale;
-    let label = format!("{}%", percentage);
-    let line_height = percentage_font * LINE_HEIGHT;
-
-    text.draw_run(
-        canvas,
-        &label,
-        container.right() + battery_font * 0.3,
-        text.baseline(container.y + (container.height - line_height) / 2.0, line_height, percentage_font),
-        percentage_font,
-        0.0,
-        ink,
-    );
-}
-
 fn draw_battery_icon(canvas: &mut Canvas, icon: Rect, percentage: u8, ink: Color) {
     let unit = icon.height / 3.175;
-    let body = Rect::new(icon.x, icon.y, 5.2 * unit, 3.175 * unit);
-    let nub = Rect::new(body.right() + 2.0, icon.y + 0.79375 * unit, 13.0, 1.5875 * unit);
+    let body = Rect::new(icon.x, icon.y, BATTERY_BODY_UNITS * unit, 3.175 * unit);
+    let nub = Rect::new(
+        body.right() + BATTERY_NUB_GAP,
+        icon.y + 0.79375 * unit,
+        BATTERY_NUB_WIDTH,
+        1.5875 * unit,
+    );
     let corner_radius = 0.79 * unit;
     let frame = 0.42 * unit;
     let inner = inset(body, frame);

@@ -18,12 +18,18 @@ use std::time::{Duration, Instant};
 use text::Text;
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::{
-    wl_buffer, wl_callback, wl_compositor, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+    wl_buffer, wl_callback, wl_compositor, wl_output, wl_pointer, wl_region, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_subcompositor,
+    wl_subsurface, wl_surface,
 };
 use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle};
+use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
-const CURSOR_SLOT_BASE: usize = 1000;
+const CURSOR_SLOT: usize = 1000;
+const BACKGROUND_SLOT: usize = 2000;
+const CONTENT_SLOT: usize = 3000;
+const BATTERY_SLOT: usize = 4000;
+
 const CURSOR_IDLE_DELAY: Duration = Duration::from_secs(5);
 const BATTERY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const DOTS_INTERVAL: Duration = Duration::from_millis(500);
@@ -44,7 +50,7 @@ fn main() {
         let backend = connection.backend();
         let socket = backend.poll_fd();
         let mut poll_fds = [PollFd::new(&socket, PollFlags::IN)];
-        poll(&mut poll_fds, Some(&Timespec { tv_sec: 0, tv_nsec: 100_000_000 })).ok();
+        poll(&mut poll_fds, Some(&Timespec { tv_sec: 0, tv_nsec: 50_000_000 })).ok();
 
         if let Some(guard) = connection.prepare_read() {
             let _ = guard.read();
@@ -57,20 +63,45 @@ fn main() {
     }
 }
 
+struct Background {
+    surface: wl_surface::WlSurface,
+    buffer: Buffers,
+}
+
+struct Layer {
+    surface: wl_surface::WlSurface,
+    subsurface: wl_subsurface::WlSubsurface,
+    buffer: Option<Buffers>,
+    position: (i32, i32),
+    mapped: bool,
+    slot: usize,
+    scale: i32,
+}
+
 struct App {
     queue_handle: QueueHandle<App>,
     shm: wl_shm::WlShm,
     compositor: wl_compositor::WlCompositor,
-    surface: wl_surface::WlSurface,
+    #[allow(dead_code)]
+    subcompositor: wl_subcompositor::WlSubcompositor,
+    parent: wl_surface::WlSurface,
+    parent_input: wl_region::WlRegion,
+    viewport: wp_viewport::WpViewport,
+    #[allow(dead_code)]
+    viewporter: wp_viewporter::WpViewporter,
     #[allow(dead_code)]
     xdg_surface: xdg_surface::XdgSurface,
     #[allow(dead_code)]
     toplevel: xdg_toplevel::XdgToplevel,
     #[allow(dead_code)]
     seat: wl_seat::WlSeat,
+    background: Background,
+    content: Layer,
+    battery_layer: Layer,
     pointer: Option<wl_pointer::WlPointer>,
+    pointer_point: (f32, f32),
+    pointer_surface: Option<wl_surface::WlSurface>,
     cursor: Cursor,
-    buffers: Option<Buffers>,
     frame_callback: Option<wl_callback::WlCallback>,
     requested_size: Option<(u32, u32)>,
     output_size: Option<(u32, u32)>,
@@ -78,32 +109,36 @@ struct App {
     scale: i32,
     configured: bool,
     configure_pending: bool,
-    dirty: bool,
     frame_ready: bool,
+    background_dirty: bool,
+    content_dirty: bool,
+    battery_dirty: bool,
     text: Text,
     display: Display,
     sun: solar::SunTimes,
     sun_date: (i32, u32, u32),
     milliseconds_into_day: f64,
-    background: canvas::Color,
+    background_color: canvas::Color,
     battery_checked: Instant,
     dots_started: Instant,
     power_off_at: Option<Instant>,
-    pointer_position: (f32, f32),
     cursor_visible: bool,
     cursor_serial: u32,
     cursor_idle_deadline: Instant,
 }
 
 impl App {
-    fn start(
-        globals: &wayland_client::globals::GlobalList,
-        queue_handle: QueueHandle<App>,
-    ) -> Self {
+    fn start(globals: &wayland_client::globals::GlobalList, queue_handle: QueueHandle<App>) -> Self {
         let compositor: wl_compositor::WlCompositor = globals
             .bind(&queue_handle, 4..=6, ())
             .expect("wl_compositor is required");
         let shm: wl_shm::WlShm = globals.bind(&queue_handle, 1..=2, ()).expect("wl_shm is required");
+        let subcompositor: wl_subcompositor::WlSubcompositor = globals
+            .bind(&queue_handle, 1..=1, ())
+            .expect("wl_subcompositor is required");
+        let viewporter: wp_viewporter::WpViewporter = globals
+            .bind(&queue_handle, 1..=1, ())
+            .expect("wp_viewporter is required");
         let wm_base: xdg_wm_base::XdgWmBase = globals
             .bind(&queue_handle, 1..=6, ())
             .expect("xdg_wm_base is required");
@@ -113,32 +148,51 @@ impl App {
             std::mem::forget(output);
         }
 
-        let surface = compositor.create_surface(&queue_handle, ());
-        let xdg_surface = wm_base.get_xdg_surface(&surface, &queue_handle, ());
+        let parent = compositor.create_surface(&queue_handle, ());
+        let viewport = viewporter.get_viewport(&parent, &queue_handle, ());
+        let parent_input = compositor.create_region(&queue_handle, ());
+        parent.set_input_region(Some(&parent_input));
+
+        let xdg_surface = wm_base.get_xdg_surface(&parent, &queue_handle, ());
         let toplevel = xdg_surface.get_toplevel(&queue_handle, ());
 
         toplevel.set_title("Buenos Aires daylight cycle".to_string());
         toplevel.set_app_id("daylight-clock".to_string());
         toplevel.set_fullscreen(None);
-        surface.commit();
+
+        let content = Layer::new(&parent, &compositor, &subcompositor, &queue_handle, CONTENT_SLOT, false);
+        let battery_layer = Layer::new(&parent, &compositor, &subcompositor, &queue_handle, BATTERY_SLOT, true);
+
+        parent.commit();
 
         let local = civil::now();
         let sun = solar::for_date(local.year, local.month, local.day);
         let milliseconds_into_day = local.milliseconds_into_day as f64;
-        let background = scene::background_at(&sun, milliseconds_into_day);
+        let background_color = scene::background_at(&sun, milliseconds_into_day);
         let battery_percentage = battery::read().map(|battery| battery.percentage);
 
         Self {
             queue_handle: queue_handle.clone(),
             shm: shm.clone(),
             compositor: compositor.clone(),
+            subcompositor: subcompositor.clone(),
             cursor: Cursor::new(&compositor, &shm, &queue_handle, 1),
-            surface,
+            parent: parent.clone(),
+            parent_input,
+            viewport,
+            viewporter,
             xdg_surface,
             toplevel,
             seat,
+            background: Background {
+                surface: parent.clone(),
+                buffer: Buffers::new(&shm, &queue_handle, 1, 1, BACKGROUND_SLOT, wl_shm::Format::Xrgb8888),
+            },
+            content,
+            battery_layer,
             pointer: None,
-            buffers: None,
+            pointer_point: (0.0, 0.0),
+            pointer_surface: None,
             frame_callback: None,
             requested_size: None,
             output_size: None,
@@ -146,8 +200,10 @@ impl App {
             scale: 1,
             configured: false,
             configure_pending: false,
-            dirty: true,
             frame_ready: true,
+            background_dirty: true,
+            content_dirty: true,
+            battery_dirty: true,
             text: Text::from_bytes(FONT_BYTES),
             display: Display {
                 page: Page::Clock,
@@ -158,11 +214,10 @@ impl App {
             sun,
             sun_date: (local.year, local.month, local.day),
             milliseconds_into_day,
-            background,
+            background_color,
             battery_checked: Instant::now(),
             dots_started: Instant::now(),
             power_off_at: None,
-            pointer_position: (0.0, 0.0),
             cursor_visible: false,
             cursor_serial: 0,
             cursor_idle_deadline: Instant::now(),
@@ -179,7 +234,7 @@ impl App {
         if (local.year, local.month, local.day) != self.sun_date {
             self.sun = solar::for_date(local.year, local.month, local.day);
             self.sun_date = (local.year, local.month, local.day);
-            self.dirty = true;
+            self.mark_all_dirty();
         }
 
         self.milliseconds_into_day = local.milliseconds_into_day as f64;
@@ -188,7 +243,7 @@ impl App {
 
         if time != self.display.time {
             self.display.time = time;
-            self.dirty = true;
+            self.content_dirty = true;
         }
 
         if self.display.page == Page::PoweringOff {
@@ -196,7 +251,7 @@ impl App {
 
             if dots as usize != self.display.dots {
                 self.display.dots = dots as usize;
-                self.dirty = true;
+                self.content_dirty = true;
             }
         }
 
@@ -205,17 +260,19 @@ impl App {
 
             if percentage != self.display.battery {
                 self.display.battery = percentage;
-                self.dirty = true;
+                self.battery_dirty = true;
             }
 
             self.battery_checked = Instant::now();
         }
 
-        let background = scene::background_at(&self.sun, self.milliseconds_into_day);
+        let background_color = scene::background_at(&self.sun, self.milliseconds_into_day);
 
-        if background != self.background {
-            self.background = background;
-            self.dirty = true;
+        if background_color != self.background_color {
+            self.background_color = background_color;
+            self.background_dirty = true;
+            self.content_dirty = true;
+            self.battery_dirty = true;
         }
 
         self.hide_idle_cursor();
@@ -226,6 +283,12 @@ impl App {
                 Command::new("systemctl").arg("poweroff").status().expect("systemctl is required");
             }
         }
+    }
+
+    fn mark_all_dirty(&mut self) {
+        self.background_dirty = true;
+        self.content_dirty = true;
+        self.battery_dirty = true;
     }
 
     fn apply_configure(&mut self) {
@@ -241,76 +304,114 @@ impl App {
 
         self.logical_size = logical_size;
 
-        let device_size = (
-            (logical_size.0 * self.scale as f32).round() as i32,
-            (logical_size.1 * self.scale as f32).round() as i32,
+        self.viewport.set_source(0.0, 0.0, 1.0, 1.0);
+        self.viewport
+            .set_destination(logical_size.0 as i32, logical_size.1 as i32);
+
+        self.parent_input.destroy();
+        self.parent_input = self.compositor.create_region(&self.queue_handle, ());
+        self.parent_input
+            .add(0, 0, logical_size.0 as i32, logical_size.1 as i32);
+        self.parent.set_input_region(Some(&self.parent_input));
+
+        self.place_layers();
+        self.configured = true;
+        self.mark_all_dirty();
+    }
+
+    fn place_layers(&mut self) {
+        let scale = self.scale as f32;
+        let (width, height) = self.logical_size;
+
+        let content = scene::content_size(&self.display, scale, &mut self.text);
+        let content_origin = (
+            ((width - content.0 / scale) / 2.0).round() as i32,
+            ((height - content.1 / scale) / 2.0).round() as i32,
         );
 
-        let needs_buffers = match &self.buffers {
-            Some(buffers) => buffers.width != device_size.0 || buffers.height != device_size.1,
-            None => true,
-        };
+        self.content.set_position(content_origin);
 
-        if needs_buffers {
-            self.buffers = Some(Buffers::new(
-                &self.shm,
-                &self.queue_handle,
-                device_size.0,
-                device_size.1,
-                2,
-                0,
-                wl_shm::Format::Xrgb8888,
-            ));
+        match scene::battery_size(&self.display, scale, &mut self.text) {
+            Some(battery) => {
+                let origin = (0, (height - battery.1 / scale).round() as i32);
+                self.battery_layer.set_position(origin);
+            }
+            None => self.battery_layer.unmap(),
         }
-
-        self.surface.set_buffer_scale(self.scale);
-        self.configured = true;
-        self.dirty = true;
     }
 
     fn render(&mut self) {
-        if !self.dirty || !self.frame_ready || !self.configured {
+        if !self.configured || !self.frame_ready {
             return;
         }
 
-        let Some(buffers) = self.buffers.as_mut() else {
-            return;
-        };
-
-        let Some(index) = (0..buffers.slots.len()).find(|index| !buffers.slots[*index].busy) else {
-            return;
-        };
-
-        buffers.slots[index].busy = true;
-
-        let slot_bytes = buffers.slot_bytes;
-
-        {
-            let slice = &mut buffers.mapping[index * slot_bytes..(index + 1) * slot_bytes];
-            let pixel_count = buffers.width as usize * buffers.height as usize;
-            let pixels = unsafe { std::slice::from_raw_parts_mut(slice.as_mut_ptr().cast::<u32>(), pixel_count) };
-            let mut canvas = Canvas::new(pixels, buffers.width, buffers.height);
-
-            scene::draw(
-                &mut canvas,
-                &self.display,
-                &self.sun,
-                self.milliseconds_into_day,
-                self.scale as f32,
-                &mut self.text,
-            );
+        if self.content_dirty || self.battery_dirty {
+            self.place_layers();
         }
 
-        let buffer = buffers.slots[index].buffer.clone();
-        let (width, height) = (buffers.width, buffers.height);
+        let mut painted = false;
 
-        self.surface.attach(Some(&buffer), 0, 0);
-        self.surface.damage_buffer(0, 0, width, height);
-        self.frame_callback = Some(self.surface.frame(&self.queue_handle, ()));
-        self.surface.commit();
+        if self.background_dirty {
+            let color = self.background_color;
+            let shm = self.shm.clone();
+            let queue_handle = self.queue_handle.clone();
+            let surface = &self.background.surface;
+            let buffer = &mut self.background.buffer;
 
-        self.dirty = false;
-        self.frame_ready = false;
+            painted |= paint_background(surface, buffer, &shm, &queue_handle, color);
+            self.background_dirty = false;
+        }
+
+        if self.content_dirty {
+            let scale = self.scale as f32;
+            let size = scene::content_size(&self.display, scale, &mut self.text);
+
+            let drawn = self.content.paint(&self.shm, &self.queue_handle, size, |canvas| {
+                scene::draw_content(
+                    canvas,
+                    &self.display,
+                    &self.sun,
+                    self.milliseconds_into_day,
+                    scale,
+                    &mut self.text,
+                )
+            });
+
+            self.content_dirty = !drawn;
+            painted |= drawn;
+        }
+
+        if self.battery_dirty {
+            let scale = self.scale as f32;
+
+            match scene::battery_size(&self.display, scale, &mut self.text) {
+                Some(size) => {
+                    let drawn = self.battery_layer.paint(&self.shm, &self.queue_handle, size, |canvas| {
+                        scene::draw_battery(
+                            canvas,
+                            &self.display,
+                            &self.sun,
+                            self.milliseconds_into_day,
+                            scale,
+                            &mut self.text,
+                        )
+                    });
+
+                    self.battery_dirty = !drawn;
+                    painted |= drawn;
+                }
+                None => {
+                    self.battery_layer.unmap();
+                    self.battery_dirty = false;
+                }
+            }
+        }
+
+        if painted {
+            self.frame_callback = Some(self.parent.frame(&self.queue_handle, ()));
+            self.parent.commit();
+            self.frame_ready = false;
+        }
     }
 
     fn hide_idle_cursor(&mut self) {
@@ -341,17 +442,35 @@ impl App {
         self.cursor_idle_deadline = Instant::now() + CURSOR_IDLE_DELAY;
     }
 
+    fn track_pointer(&mut self, surface: wl_surface::WlSurface, x: f32, y: f32) {
+        let on_content = surface == self.content.surface;
+
+        if on_content {
+            self.pointer_point = (x, y);
+        }
+
+        self.pointer_surface = Some(surface);
+    }
+
+    fn pointer_on_content(&self) -> bool {
+        self.pointer_surface.as_ref() == Some(&self.content.surface)
+    }
+
     fn press(&mut self) {
-        let action = scene::action_at(&self.display, self.logical_size, self.pointer_position, &mut self.text);
+        if !self.pointer_on_content() {
+            return;
+        }
+
+        let action = scene::action_at(&self.display, self.pointer_point, &mut self.text);
 
         match action {
             Some(Action::AskForPowerOff) => {
                 self.display.page = Page::ConfirmPowerOff;
-                self.dirty = true;
+                self.content_dirty = true;
             }
             Some(Action::Cancel) => {
                 self.display.page = Page::Clock;
-                self.dirty = true;
+                self.content_dirty = true;
             }
             Some(Action::PowerOff) => {
                 if self.display.page != Page::PoweringOff {
@@ -359,7 +478,7 @@ impl App {
                     self.display.dots = 0;
                     self.dots_started = Instant::now();
                     self.power_off_at = Some(Instant::now() + POWER_OFF_DELAY);
-                    self.dirty = true;
+                    self.content_dirty = true;
                 }
             }
             None => {}
@@ -373,24 +492,148 @@ impl App {
 
         self.scale = scale;
         self.cursor = Cursor::new(&self.compositor, &self.shm, &self.queue_handle, scale);
+        self.content.set_scale(scale);
+        self.battery_layer.set_scale(scale);
         self.configure_pending = true;
     }
 
     fn release_slot(&mut self, slot: usize) {
-        if slot >= CURSOR_SLOT_BASE {
-            if let Some(buffer_slot) = self.cursor.buffers.slots.get_mut(slot - CURSOR_SLOT_BASE) {
-                buffer_slot.busy = false;
+        match slot {
+            CURSOR_SLOT => self.cursor.buffer.busy = false,
+            BACKGROUND_SLOT => self.background.buffer.busy = false,
+            CONTENT_SLOT => {
+                if let Some(buffer) = self.content.buffer.as_mut() {
+                    buffer.busy = false;
+                }
             }
+            BATTERY_SLOT => {
+                if let Some(buffer) = self.battery_layer.buffer.as_mut() {
+                    buffer.busy = false;
+                }
+            }
+            _ => {}
+        }
+    }
+}
 
+impl Layer {
+    fn new(
+        parent: &wl_surface::WlSurface,
+        compositor: &wl_compositor::WlCompositor,
+        subcompositor: &wl_subcompositor::WlSubcompositor,
+        queue_handle: &QueueHandle<App>,
+        slot: usize,
+        ignore_input: bool,
+    ) -> Self {
+        let surface = compositor.create_surface(queue_handle, ());
+        let subsurface = subcompositor.get_subsurface(&surface, parent, queue_handle, ());
+
+        subsurface.set_desync();
+
+        if ignore_input {
+            let region = compositor.create_region(queue_handle, ());
+            surface.set_input_region(Some(&region));
+            region.destroy();
+        }
+
+        Self {
+            surface,
+            subsurface,
+            buffer: None,
+            position: (0, 0),
+            mapped: false,
+            slot,
+            scale: 1,
+        }
+    }
+
+    fn set_scale(&mut self, scale: i32) {
+        self.scale = scale;
+        self.surface.set_buffer_scale(scale);
+        self.surface.commit();
+    }
+
+    fn set_position(&mut self, position: (i32, i32)) {
+        if self.position == position {
             return;
         }
 
-        if let Some(buffers) = self.buffers.as_mut() {
-            if let Some(buffer_slot) = buffers.slots.get_mut(slot) {
-                buffer_slot.busy = false;
-            }
-        }
+        self.position = position;
+        self.subsurface.set_position(position.0, position.1);
+        self.surface.commit();
     }
+
+    fn unmap(&mut self) {
+        if !self.mapped {
+            return;
+        }
+
+        self.surface.attach(None, 0, 0);
+        self.surface.commit();
+        self.mapped = false;
+    }
+
+    fn paint(
+        &mut self,
+        shm: &wl_shm::WlShm,
+        queue_handle: &QueueHandle<App>,
+        size: (f32, f32),
+        paint: impl FnOnce(&mut Canvas),
+    ) -> bool {
+        let width = size.0.round() as i32;
+        let height = size.1.round() as i32;
+
+        let buffer = match &mut self.buffer {
+            Some(buffer) if buffer.width == width && buffer.height == height => buffer,
+            _ => self
+                .buffer
+                .insert(Buffers::new(shm, queue_handle, width, height, self.slot, wl_shm::Format::Xrgb8888)),
+        };
+
+        if buffer.busy {
+            return false;
+        }
+
+        {
+            let pixels = buffer.pixels();
+            paint(&mut Canvas::new(pixels, width, height));
+        }
+
+        self.surface.set_buffer_scale(self.scale);
+        self.surface.attach(Some(&buffer.buffer), 0, 0);
+        self.surface.damage_buffer(0, 0, width, height);
+        self.surface.commit();
+
+        buffer.busy = true;
+        self.mapped = true;
+
+        true
+    }
+}
+
+fn paint_background(
+    surface: &wl_surface::WlSurface,
+    buffer: &mut Buffers,
+    shm: &wl_shm::WlShm,
+    queue_handle: &QueueHandle<App>,
+    color: canvas::Color,
+) -> bool {
+    if buffer.busy {
+        return false;
+    }
+
+    if (buffer.width, buffer.height) != (1, 1) {
+        *buffer = Buffers::new(shm, queue_handle, 1, 1, BACKGROUND_SLOT, wl_shm::Format::Xrgb8888);
+    }
+
+    let pixels = buffer.pixels();
+    Canvas::new(pixels, 1, 1).clear(color);
+
+    surface.attach(Some(&buffer.buffer), 0, 0);
+    surface.damage_buffer(0, 0, 1, 1);
+    buffer.busy = true;
+
+    true
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for App {
@@ -434,13 +677,16 @@ impl Dispatch<wl_pointer::WlPointer, ()> for App {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            wl_pointer::Event::Enter { serial, surface_x, surface_y, .. } => {
-                state.pointer_position = (surface_x as f32, surface_y as f32);
+            wl_pointer::Event::Enter { serial, surface, surface_x, surface_y } => {
                 state.cursor_serial = serial;
+                state.track_pointer(surface, surface_x as f32, surface_y as f32);
                 state.show_cursor();
             }
             wl_pointer::Event::Motion { surface_x, surface_y, .. } => {
-                state.pointer_position = (surface_x as f32, surface_y as f32);
+                if let Some(surface) = state.pointer_surface.clone() {
+                    state.track_pointer(surface, surface_x as f32, surface_y as f32);
+                }
+
                 state.show_cursor();
             }
             wl_pointer::Event::Button { button, state: button_state, .. } => {
@@ -449,6 +695,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for App {
                 }
             }
             wl_pointer::Event::Leave { .. } => {
+                state.pointer_surface = None;
                 state.cursor_visible = false;
             }
             _ => {}
@@ -560,20 +807,20 @@ delegate_noop!(App: ignore wl_compositor::WlCompositor);
 delegate_noop!(App: ignore wl_surface::WlSurface);
 delegate_noop!(App: ignore wl_shm::WlShm);
 delegate_noop!(App: ignore wl_shm_pool::WlShmPool);
-
-struct Slot {
-    buffer: wl_buffer::WlBuffer,
-    busy: bool,
-}
+delegate_noop!(App: ignore wl_region::WlRegion);
+delegate_noop!(App: ignore wl_subcompositor::WlSubcompositor);
+delegate_noop!(App: ignore wl_subsurface::WlSubsurface);
+delegate_noop!(App: ignore wp_viewporter::WpViewporter);
+delegate_noop!(App: ignore wp_viewport::WpViewport);
 
 struct Buffers {
     _file: File,
     _pool: wl_shm_pool::WlShmPool,
     mapping: MmapMut,
-    slots: Vec<Slot>,
+    buffer: wl_buffer::WlBuffer,
+    busy: bool,
     width: i32,
     height: i32,
-    slot_bytes: usize,
 }
 
 impl Buffers {
@@ -582,50 +829,40 @@ impl Buffers {
         queue_handle: &QueueHandle<App>,
         width: i32,
         height: i32,
-        count: usize,
-        slot_base: usize,
+        slot: usize,
         format: wl_shm::Format,
     ) -> Self {
         let stride = width * 4;
-        let slot_bytes = (stride * height) as usize;
-        let total_bytes = slot_bytes * count;
+        let bytes = (stride * height) as usize;
 
         let file = File::from(memfd_create("daylight-clock", MemfdFlags::CLOEXEC).unwrap());
-        file.set_len(total_bytes as u64).unwrap();
+        file.set_len(bytes as u64).unwrap();
 
         let mapping = unsafe { MmapMut::map_mut(&file) }.unwrap();
-        let pool = shm.create_pool(file.as_fd(), total_bytes as i32, queue_handle, ());
-
-        let slots = (0..count)
-            .map(|index| Slot {
-                buffer: pool.create_buffer(
-                    (index * slot_bytes) as i32,
-                    width,
-                    height,
-                    stride,
-                    format,
-                    queue_handle,
-                    slot_base + index,
-                ),
-                busy: false,
-            })
-            .collect();
+        let pool = shm.create_pool(file.as_fd(), bytes as i32, queue_handle, ());
+        let buffer = pool.create_buffer::<usize, App>(0, width, height, stride, format.into(), queue_handle, slot);
 
         Self {
             _file: file,
             _pool: pool,
             mapping,
-            slots,
+            buffer,
+            busy: false,
             width,
             height,
-            slot_bytes,
         }
+    }
+
+    fn pixels(&mut self) -> &mut [u32] {
+        let count = self.width as usize * self.height as usize;
+
+        unsafe { std::slice::from_raw_parts_mut(self.mapping.as_mut_ptr().cast::<u32>(), count) }
     }
 }
 
 struct Cursor {
     surface: wl_surface::WlSurface,
-    buffers: Buffers,
+    buffer: Buffers,
     hotspot: (i32, i32),
 }
 
@@ -640,27 +877,21 @@ impl Cursor {
     ) -> Self {
         let width = Self::LOGICAL_SIZE.0 * scale;
         let height = Self::LOGICAL_SIZE.1 * scale;
-        let mut buffers = Buffers::new(shm, queue_handle, width, height, 1, CURSOR_SLOT_BASE, wl_shm::Format::Argb8888);
+        let mut buffer = Buffers::new(shm, queue_handle, width, height, CURSOR_SLOT, wl_shm::Format::Argb8888);
 
-        {
-            let pixels = unsafe {
-                std::slice::from_raw_parts_mut(buffers.mapping.as_mut_ptr().cast::<u32>(), (width * height) as usize)
-            };
-
-            draw_cursor(pixels, width, height, scale);
-        }
+        draw_cursor(buffer.pixels(), width, height, scale);
 
         let surface = compositor.create_surface(queue_handle, ());
         surface.set_buffer_scale(scale);
-        surface.attach(Some(&buffers.slots[0].buffer), 0, 0);
+        surface.attach(Some(&buffer.buffer), 0, 0);
         surface.damage_buffer(0, 0, width, height);
         surface.commit();
 
-        buffers.slots[0].busy = true;
+        buffer.busy = true;
 
         Self {
             surface,
-            buffers,
+            buffer,
             hotspot: (0, 0),
         }
     }
