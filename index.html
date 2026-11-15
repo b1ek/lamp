@@ -245,21 +245,6 @@
   </script>
 
   <script>
-    (() => {
-      const anim = document.getElementById('poweroffanimation');
-      let i = 0;
-      async function poweroffAnimRender() {
-        anim.innerText = '.'.repeat(i).padEnd(4, ' ');
-        i += 1;
-        if (i == 4) i = 0;
-        await delay(500);
-        requestAnimationFrame(poweroffAnimRender);
-      }
-      poweroffAnimRender();
-    })()
-  </script>
-
-  <script>
       (async () => {
         const poweroffButton = document.getElementById('poweroffButton');
         const yesPoweroffButton = document.getElementById('yesPoweroffButton');
@@ -291,6 +276,17 @@
         }
         yesPoweroffButton.onclick = async () => {
           await setActivePage(poweringoff);
+          
+          const anim = document.getElementById('poweroffanimation');
+          let i = 0;
+          async function poweroffAnimRender() {
+            anim.innerText = '.'.repeat(i).padEnd(4, ' ');
+            i += 1;
+            if (i == 4) i = 0;
+            await delay(500);
+            requestAnimationFrame(poweroffAnimRender);
+          }
+          poweroffAnimRender();
         }
       })();
   </script>
