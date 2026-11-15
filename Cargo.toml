@@ -1,0 +1,18 @@
+[package]
+name = "daylight-clock"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wayland-client = { version = "0.31", features = ["system"] }
+wayland-protocols = { version = "0.32", features = ["client"] }
+memmap2 = "0.9"
+fontdue = "0.9"
+rustix = { version = "1", features = ["event", "fs", "time"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = "z"
+strip = true
