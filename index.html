@@ -60,6 +60,24 @@
       display: flex;
       flex-direction: column;
     }
+
+    .battery {
+      color: var(--text-color);
+      mix-blend-mode: difference;
+      font-size: 2em;
+      position: fixed;
+      bottom: 0; left: 0;
+      display: flex;
+      flex-direction: row;
+      gap: .3em;
+      justify-content: center;
+      align-items: center;
+      margin-left: 1em;
+      margin-bottom: .5em;
+    }
+    .battery #batteryPercentageDisplay {
+      font-size: .7em;
+    }
   </style>
 </head>
 <body>
@@ -97,6 +115,13 @@
         <span>Powering off</span><pre style="margin:0" id="poweroffanimation">...</pre>
       </button>
     </div>
+  </div>
+
+  <div class="battery">
+    <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 6 3.175">
+      <rect id="batterySvgDisplay" fill="currentColor" x=".4" y=".4" width="4.5" height="2.3"></rect>
+      <path fill="currentColor" d="M.818192 3.175c-.227465 0-.420553-.0773-.579553-.23151C.07936 2.78924 0 2.60165 0 2.38125V.79375C0 .57335.079371.38576.238639.23151.397639.07726.590727 0 .818192 0h3.68186c.227186 0 .420275.0773.579553.23151.159.15425.238639.34184.238639.56224v1.5875c0 .2204-.07968.40799-.23864.56224-.159277.15425-.352366.23151-.579553.23151Zm0-.52916h3.68186c.077205 0 .142094-.0254.194459-.0762s.078237-.11351.078237-.18839V.79375c0-.0749-.026182-.13785-.078546-.18838-.052364-.0505-.117274-.0759-.194181-.0762H.81816c-.077412 0-.142095.0254-.19419.0762C.571605.65617.545423.71888.545423.79375v1.5875c0 .0749.026182.13785.078546.18865s.117005.0762.194191.0759m4.77279-.39688V.926h.136363c.077206 0 .142085.0254.194449.0762S6 1.11571 6 1.19059v.79375c0 .0749-.026182.13785-.078546.18865s-.117273.0762-.19418.0759Z" style="stroke-width:.268626px"/>
+    </svg><span id="batteryPercentageDisplay">100%</span>
   </div>
 
   <script>
@@ -276,7 +301,7 @@
         }
         yesPoweroffButton.onclick = async () => {
           await setActivePage(poweringoff);
-          
+
           const anim = document.getElementById('poweroffanimation');
           let i = 0;
           async function poweroffAnimRender() {
@@ -289,6 +314,20 @@
           poweroffAnimRender();
         }
       })();
+  </script>
+
+  <script>
+    (async () => {
+      const batterySvgDisplay = document.getElementById('batterySvgDisplay');
+      const batteryPercentageDisplay = document.getElementById('batteryPercentageDisplay');
+
+      function updateBattery(percentage) {
+        batteryPercentageDisplay.innerText = Math.floor(percentage * 100).toString() + '%';
+        batterySvgDisplay.setAttribute('width', Math.min(percentage * 4.5, 4.5));
+      }
+
+      updateBattery(1);
+    })()
   </script>
 </body>
 </html>
