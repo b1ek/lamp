@@ -412,8 +412,6 @@ fn draw_battery_icon(canvas: &mut Canvas, icon: Rect, percentage: u8, charging: 
         |x, y| inside_round_rect(x, y, nub, 0.35 * unit),
     );
 
-    println!("{charging}");
-
     if charging {
         draw_charge_bolt(canvas, body, unit, ink, background);
     }

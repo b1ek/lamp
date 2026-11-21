@@ -31,7 +31,7 @@ const CONTENT_SLOT: usize = 3000;
 const BATTERY_SLOT: usize = 4000;
 
 const CURSOR_IDLE_DELAY: Duration = Duration::from_secs(5);
-const BATTERY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const BATTERY_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const DOTS_INTERVAL: Duration = Duration::from_millis(500);
 const POWER_OFF_DELAY: Duration = Duration::from_millis(750);
 const BUTTON_LEFT: u32 = 0x110;
@@ -120,6 +120,7 @@ struct App {
     milliseconds_into_day: f64,
     background_color: canvas::Color,
     battery_checked: Instant,
+    battery_events: battery::Events,
     dots_started: Instant,
     power_off_at: Option<Instant>,
     cursor_visible: bool,
@@ -170,6 +171,7 @@ impl App {
         let milliseconds_into_day = local.milliseconds_into_day as f64;
         let background_color = scene::background_at(&sun, milliseconds_into_day);
         let battery_state = battery::read();
+        let battery_events = battery::Events::new();
 
         Self {
             queue_handle: queue_handle.clone(),
@@ -217,6 +219,7 @@ impl App {
             milliseconds_into_day,
             background_color,
             battery_checked: Instant::now(),
+            battery_events,
             dots_started: Instant::now(),
             power_off_at: None,
             cursor_visible: false,
@@ -256,18 +259,10 @@ impl App {
             }
         }
 
-        if self.battery_checked.elapsed() >= BATTERY_REFRESH_INTERVAL {
-            let state = battery::read();
-            let percentage = state.as_ref().map(|battery| battery.percentage);
-            let charging = state.as_ref().map_or(false, |battery| battery.charging);
+        let battery_changed = self.battery_events.power_supply_changed();
 
-            if percentage != self.display.battery || charging != self.display.charging {
-                self.display.battery = percentage;
-                self.display.charging = charging;
-                self.battery_dirty = true;
-            }
-
-            self.battery_checked = Instant::now();
+        if battery_changed || self.battery_checked.elapsed() >= BATTERY_REFRESH_INTERVAL {
+            self.refresh_battery();
         }
 
         let background_color = scene::background_at(&self.sun, self.milliseconds_into_day);
@@ -287,6 +282,24 @@ impl App {
                 Command::new("systemctl").arg("poweroff").status().expect("systemctl is required");
             }
         }
+    }
+
+    fn refresh_battery(&mut self) {
+        let state = battery::read();
+        let percentage = state.as_ref().map(|battery| battery.percentage);
+        let charging = state.as_ref().map_or(false, |battery| battery.charging);
+
+        if std::env::var_os("DAYLIGHT_CLOCK_DEBUG").is_some() {
+            eprintln!("battery percentage={percentage:?} charging={charging}");
+        }
+
+        if percentage != self.display.battery || charging != self.display.charging {
+            self.display.battery = percentage;
+            self.display.charging = charging;
+            self.battery_dirty = true;
+        }
+
+        self.battery_checked = Instant::now();
     }
 
     fn mark_all_dirty(&mut self) {

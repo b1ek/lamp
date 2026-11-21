@@ -8,7 +8,7 @@ wayland-client = { version = "0.31", default-features = false }
 wayland-protocols = { version = "0.32", features = ["client"] }
 memmap2 = "0.9"
 fontdue = "0.9"
-rustix = { version = "1", features = ["event", "fs", "mm", "time"] }
+rustix = { version = "1", features = ["event", "fs", "mm", "net", "time"] }
 
 [profile.release]
 lto = "fat"

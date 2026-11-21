@@ -18,7 +18,7 @@ Single Rust binary, no build system beyond Cargo. No dependencies beyond `waylan
 - `src/text.rs` — fontdue wrapper with a glyph raster cache keyed by character plus quantized size.
 - `src/civil.rs` — civil time conversion, hardcoded UTC-3 offset, `format_clock`, day-of-year.
 - `src/solar.rs` — NOAA-style solar position math, hardcoded Buenos Aires latitude / longitude.
-- `src/battery.rs` — reads `/sys/class/power_supply`, prefers `capacity`, falls back to `energy_now/energy_full`.
+- `src/battery.rs` — reads `/sys/class/power_supply`, picks the `System`-scope battery (skips absent and peripheral `Device` batteries), prefers `capacity`, falls back to `energy_now/energy_full`. Charging means external power is connected: `Charging`, `Not charging` and `Full` count as charging, `Discharging` does not; `Unknown` or missing status falls back to any supply with `online == 1`. `battery::Events` is a nonblocking netlink `KOBJECT_UEVENT` listener that filters `SUBSYSTEM=power_supply`, so plug, unplug and level changes are picked up within one 50 ms loop iteration.
 - `assets/DejaVuSansMono-subset.ttf` — glyph subset embedded via `include_bytes!`. Adding new characters to any rendered string requires regenerating this subset; otherwise glyphs render blank.
 - `index.html` — legacy web version, kept as an archive. Do not modify or delete it.
 
@@ -53,10 +53,11 @@ Input: the parent surface has a fully covering input region so the whole topleve
 - No defensive fallbacks for programmer errors. Missing Wayland globals and unusable font data panic with a clear message on purpose.
 - Layout constants live at the top of `scene.rs`; changing a font size or padding usually requires adjusting the derived sizes in `content_size` and `battery_size` together, because the surfaces are sized to exact content bounds.
 - Sizes are recomputed from the same functions that draw, so layout and hit-testing stay in agreement. Keep that property: any new widget needs both a size function and a matching draw function, and hit testing must use the same origin math.
-- Battery percentage is refreshed every 30 s; power-off runs `systemctl poweroff` 750 ms after confirmation so the "powering off" dots are visible.
+- Battery state is event driven: `battery::Events` wakes the re-read on any power supply uevent, with a 30 s poll as fallback. Power-off runs `systemctl poweroff` 750 ms after confirmation so the "powering off" dots are visible.
 
 ## Known state
 
 - `Cargo.toml` and `src/main.rs` contain uncommitted work: `wayland-client` switched to `default-features = false` and buffers are `madvise(DONTNEED)`-ed after commit to keep RSS low. Preserve that behaviour.
+- inotify on `/sys/class/power_supply` does not work: the power supply core only emits kobject uevents and never calls `kernfs_notify`, so fsnotify never fires for `status` or `capacity`. Charging updates come from the netlink uevent listener instead.
 - `.vite/` is an untracked leftover from the web version and is not referenced by the Rust build.
 - Application identity and window title are `daylight-clock` / `Buenos Aires daylight cycle`.
