@@ -1,3 +1,8 @@
+#![no_std]
+#![no_main]
+
+extern crate alloc;
+
 mod battery;
 mod canvas;
 mod civil;
@@ -5,104 +10,137 @@ mod scene;
 mod solar;
 mod text;
 
+use alloc::vec::Vec;
 use canvas::Canvas;
-use memmap2::MmapMut;
+use core::ffi::c_void;
+use core::fmt::Write;
+use core_maths::CoreFloat;
+use lean_mmap::MmapMut;
+use linked_list_allocator::LockedHeap;
 use rustix::event::{poll, PollFd, PollFlags};
-use rustix::fs::{memfd_create, MemfdFlags};
+use rustix::fd::AsFd;
+use rustix::fs::{ftruncate, memfd_create, MemfdFlags};
+use rustix::mm::{mmap_anonymous, MapFlags, ProtFlags};
+use rustix::runtime_448b8ad740e2a26f::{execve, exit_group};
 use rustix::time::Timespec;
 use scene::{Action, Display, Page};
-use std::fs::File;
-use std::os::fd::AsFd;
-use std::process::Command;
-use std::time::{Duration, Instant};
 use text::Text;
-use wayland_client::globals::{registry_queue_init, GlobalListContents};
-use wayland_client::protocol::{
-    wl_buffer, wl_callback, wl_compositor, wl_output, wl_pointer, wl_region, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_subcompositor,
-    wl_subsurface, wl_surface,
+use wayland_lite::{
+    ButtonState, Client, Event, ObjectId, SeatCapabilities, ShmFormat, WlBuffer, WlCallback, WlCompositor, WlOutput,
+    WlPointer, WlRegion, WlSeat, WlShm, WlShmPool, WlSubcompositor, WlSubsurface, WlSurface, WpViewport, WpViewporter,
+    XdgSurface, XdgToplevel, XdgWmBase,
 };
-use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle};
-use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
-use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
-const CURSOR_SLOT: usize = 1000;
-const BACKGROUND_SLOT: usize = 2000;
-const CONTENT_SLOT: usize = 3000;
-const BATTERY_SLOT: usize = 4000;
-
-const CURSOR_IDLE_DELAY: Duration = Duration::from_secs(5);
-const BATTERY_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
-const DOTS_INTERVAL: Duration = Duration::from_millis(500);
-const POWER_OFF_DELAY: Duration = Duration::from_millis(750);
+const CURSOR_IDLE_DELAY: f64 = 5_000.0;
+const BATTERY_REFRESH_INTERVAL: f64 = 2_000.0;
+const DOTS_INTERVAL: f64 = 500.0;
+const POWER_OFF_DELAY: f64 = 750.0;
 const BUTTON_LEFT: u32 = 0x110;
 const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono-subset.ttf");
+const HEAP_SIZE: usize = 4 * 1024 * 1024;
+const SYSTEMCTL_PATHS: [&[u8]; 3] = [b"/usr/bin/systemctl\0", b"/bin/systemctl\0", b"/usr/sbin/systemctl\0"];
 
-fn main() {
-    let connection = Connection::connect_to_env().expect("wayland compositor is required");
-    let (globals, mut event_queue) =
-        registry_queue_init::<App>(&connection).expect("wayland registry is unavailable");
-    let queue_handle = event_queue.handle();
-    let mut app = App::start(&globals, queue_handle);
+#[global_allocator]
+static ALLOCATOR: LockedHeap = LockedHeap::empty();
+
+#[unsafe(naked)]
+#[no_mangle]
+unsafe extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "xor ebp, ebp",
+        "and rsp, -16",
+        "call {entry}",
+        "ud2",
+        entry = sym rust_entry,
+    );
+}
+
+fn rust_entry() -> ! {
+    init_allocator();
+    run();
+}
+
+fn init_allocator() {
+    let heap = unsafe {
+        mmap_anonymous(
+            core::ptr::null_mut(),
+            HEAP_SIZE,
+            ProtFlags::READ | ProtFlags::WRITE,
+            MapFlags::PRIVATE,
+        )
+    }
+    .expect("heap mapping is required");
+
+    unsafe { ALLOCATOR.lock().init(heap.cast::<u8>(), HEAP_SIZE) };
+}
+
+fn run() -> ! {
+    let mut client = Client::connect().expect("wayland compositor is required");
+    client.roundtrip().expect("wayland registry roundtrip failed");
+    let mut app = App::start(&mut client);
 
     loop {
-        connection.flush().expect("wayland connection is broken");
+        client.flush().expect("wayland flush failed");
 
-        let backend = connection.backend();
-        let socket = backend.poll_fd();
-        let mut poll_fds = [PollFd::new(&socket, PollFlags::IN)];
-        poll(&mut poll_fds, Some(&Timespec { tv_sec: 0, tv_nsec: 50_000_000 })).ok();
-
-        if let Some(guard) = connection.prepare_read() {
-            let _ = guard.read();
+        {
+            let socket = client.poll_fd();
+            let mut descriptors = [PollFd::new(&socket, PollFlags::IN)];
+            poll(&mut descriptors, Some(&Timespec { tv_sec: 0, tv_nsec: 50_000_000 })).ok();
         }
 
-        event_queue.dispatch_pending(&mut app).expect("wayland dispatch failed");
+        client.read().expect("wayland read failed");
 
-        app.tick();
-        app.render();
+        while let Some(event) = client.next_event().expect("wayland event decoding failed") {
+            app.handle_event(&mut client, event);
+        }
+
+        app.tick(&mut client);
+        app.render(&mut client);
     }
 }
 
 struct Background {
-    surface: wl_surface::WlSurface,
+    surface: WlSurface,
     buffer: Buffers,
 }
 
 struct Layer {
-    surface: wl_surface::WlSurface,
-    subsurface: wl_subsurface::WlSubsurface,
+    surface: WlSurface,
+    subsurface: WlSubsurface,
     buffer: Option<Buffers>,
     position: (i32, i32),
     mapped: bool,
-    slot: usize,
     scale: i32,
 }
 
 struct App {
-    queue_handle: QueueHandle<App>,
-    shm: wl_shm::WlShm,
-    compositor: wl_compositor::WlCompositor,
+    compositor: WlCompositor,
+    shm: WlShm,
     #[allow(dead_code)]
-    subcompositor: wl_subcompositor::WlSubcompositor,
-    parent: wl_surface::WlSurface,
-    parent_input: wl_region::WlRegion,
-    viewport: wp_viewport::WpViewport,
+    subcompositor: WlSubcompositor,
     #[allow(dead_code)]
-    viewporter: wp_viewporter::WpViewporter,
+    viewporter: WpViewporter,
     #[allow(dead_code)]
-    xdg_surface: xdg_surface::XdgSurface,
+    wm_base: XdgWmBase,
+    parent: WlSurface,
+    parent_input: WlRegion,
+    viewport: WpViewport,
     #[allow(dead_code)]
-    toplevel: xdg_toplevel::XdgToplevel,
+    xdg_surface: XdgSurface,
     #[allow(dead_code)]
-    seat: wl_seat::WlSeat,
+    toplevel: XdgToplevel,
+    #[allow(dead_code)]
+    seat: WlSeat,
+    #[allow(dead_code)]
+    output: Option<WlOutput>,
     background: Background,
     content: Layer,
     battery_layer: Layer,
-    pointer: Option<wl_pointer::WlPointer>,
+    pointer: Option<WlPointer>,
     pointer_point: (f32, f32),
-    pointer_surface: Option<wl_surface::WlSurface>,
+    pointer_surface: Option<WlSurface>,
     cursor: Cursor,
-    frame_callback: Option<wl_callback::WlCallback>,
+    frame_callback: Option<WlCallback>,
     requested_size: Option<(u32, u32)>,
     output_size: Option<(u32, u32)>,
     logical_size: (f32, f32),
@@ -119,52 +157,57 @@ struct App {
     sun_date: (i32, u32, u32),
     milliseconds_into_day: f64,
     background_color: canvas::Color,
-    battery_checked: Instant,
+    battery_checked: f64,
     battery_events: battery::Events,
-    dots_started: Instant,
-    power_off_at: Option<Instant>,
+    dots_started: f64,
+    power_off_at: Option<f64>,
     cursor_visible: bool,
     cursor_serial: u32,
-    cursor_idle_deadline: Instant,
+    cursor_idle_deadline: f64,
 }
 
 impl App {
-    fn start(globals: &wayland_client::globals::GlobalList, queue_handle: QueueHandle<App>) -> Self {
-        let compositor: wl_compositor::WlCompositor = globals
-            .bind(&queue_handle, 4..=6, ())
-            .expect("wl_compositor is required");
-        let shm: wl_shm::WlShm = globals.bind(&queue_handle, 1..=2, ()).expect("wl_shm is required");
-        let subcompositor: wl_subcompositor::WlSubcompositor = globals
-            .bind(&queue_handle, 1..=1, ())
-            .expect("wl_subcompositor is required");
-        let viewporter: wp_viewporter::WpViewporter = globals
-            .bind(&queue_handle, 1..=1, ())
-            .expect("wp_viewporter is required");
-        let wm_base: xdg_wm_base::XdgWmBase = globals
-            .bind(&queue_handle, 1..=6, ())
-            .expect("xdg_wm_base is required");
-        let seat: wl_seat::WlSeat = globals.bind(&queue_handle, 1..=9, ()).expect("wl_seat is required");
+    fn start(client: &mut Client) -> Self {
+        let compositor = bind::<WlCompositor>(client, 6);
+        let shm = bind::<WlShm>(client, 2);
+        let subcompositor = bind::<WlSubcompositor>(client, 1);
+        let viewporter = bind::<WpViewporter>(client, 1);
+        let wm_base = bind::<XdgWmBase>(client, 6);
+        let seat = bind::<WlSeat>(client, 9);
 
-        if let Ok(output) = globals.bind::<wl_output::WlOutput, _, _>(&queue_handle, 1..=4, ()) {
-            std::mem::forget(output);
-        }
+        let output_version = client.global("wl_output").map(|global| global.version.min(4));
+        let output = output_version.map(|version| client.bind::<WlOutput>(version).expect("wl_output bind failed"));
 
-        let parent = compositor.create_surface(&queue_handle, ());
-        let viewport = viewporter.get_viewport(&parent, &queue_handle, ());
-        let parent_input = compositor.create_region(&queue_handle, ());
-        parent.set_input_region(Some(&parent_input));
+        let parent = client.compositor_create_surface(compositor).expect("surface creation failed");
+        let viewport = client
+            .viewporter_get_viewport(viewporter, parent)
+            .expect("viewport creation failed");
+        let parent_input = client.compositor_create_region(compositor).expect("region creation failed");
+        client
+            .surface_set_input_region(parent, Some(parent_input))
+            .expect("input region failed");
 
-        let xdg_surface = wm_base.get_xdg_surface(&parent, &queue_handle, ());
-        let toplevel = xdg_surface.get_toplevel(&queue_handle, ());
+        let xdg_surface = client
+            .xdg_wm_base_get_xdg_surface(wm_base, parent)
+            .expect("xdg surface creation failed");
+        let toplevel = client
+            .xdg_surface_get_toplevel(xdg_surface)
+            .expect("toplevel creation failed");
 
-        toplevel.set_title("Buenos Aires daylight cycle".to_string());
-        toplevel.set_app_id("daylight-clock".to_string());
-        toplevel.set_fullscreen(None);
+        client
+            .xdg_toplevel_set_title(toplevel, "Buenos Aires daylight cycle")
+            .expect("title failed");
+        client
+            .xdg_toplevel_set_app_id(toplevel, "daylight-clock")
+            .expect("app id failed");
+        client
+            .xdg_toplevel_set_fullscreen(toplevel, None)
+            .expect("fullscreen failed");
 
-        let content = Layer::new(&parent, &compositor, &subcompositor, &queue_handle, CONTENT_SLOT, false);
-        let battery_layer = Layer::new(&parent, &compositor, &subcompositor, &queue_handle, BATTERY_SLOT, true);
+        let content = Layer::new(client, compositor, subcompositor, parent, false);
+        let battery_layer = Layer::new(client, compositor, subcompositor, parent, true);
 
-        parent.commit();
+        client.surface_commit(parent).expect("parent commit failed");
 
         let local = civil::now();
         let sun = solar::for_date(local.year, local.month, local.day);
@@ -172,29 +215,31 @@ impl App {
         let background_color = scene::background_at(&sun, milliseconds_into_day);
         let battery_state = battery::read();
         let battery_events = battery::Events::new();
+        let now = civil::monotonic_milliseconds();
 
         Self {
-            queue_handle: queue_handle.clone(),
-            shm: shm.clone(),
-            compositor: compositor.clone(),
-            subcompositor: subcompositor.clone(),
-            cursor: Cursor::new(&compositor, &shm, &queue_handle, 1),
-            parent: parent.clone(),
+            compositor,
+            shm,
+            subcompositor,
+            viewporter,
+            wm_base,
+            parent,
             parent_input,
             viewport,
-            viewporter,
             xdg_surface,
             toplevel,
             seat,
+            output,
             background: Background {
-                surface: parent.clone(),
-                buffer: Buffers::new(&shm, &queue_handle, 1, 1, BACKGROUND_SLOT, wl_shm::Format::Xrgb8888),
+                surface: parent,
+                buffer: Buffers::new(client, shm, 1, 1, ShmFormat::Xrgb8888),
             },
             content,
             battery_layer,
             pointer: None,
             pointer_point: (0.0, 0.0),
             pointer_surface: None,
+            cursor: Cursor::new(client, compositor, shm, 1),
             frame_callback: None,
             requested_size: None,
             output_size: None,
@@ -218,19 +263,87 @@ impl App {
             sun_date: (local.year, local.month, local.day),
             milliseconds_into_day,
             background_color,
-            battery_checked: Instant::now(),
+            battery_checked: now,
             battery_events,
-            dots_started: Instant::now(),
+            dots_started: now,
             power_off_at: None,
             cursor_visible: false,
             cursor_serial: 0,
-            cursor_idle_deadline: Instant::now(),
+            cursor_idle_deadline: now,
         }
     }
 
-    fn tick(&mut self) {
+    fn handle_event(&mut self, client: &mut Client, event: Event) {
+        match event {
+            Event::SeatCapabilities { seat, capabilities } => {
+                if capabilities.contains(SeatCapabilities::POINTER) && self.pointer.is_none() {
+                    self.pointer = Some(client.seat_get_pointer(seat).expect("pointer creation failed"));
+                }
+            }
+            Event::PointerEnter {
+                serial,
+                surface,
+                surface_x,
+                surface_y,
+                ..
+            } => {
+                self.cursor_serial = serial;
+                self.track_pointer(surface, surface_x, surface_y);
+                self.show_cursor(client);
+            }
+            Event::PointerMotion {
+                surface_x, surface_y, ..
+            } => {
+                if let Some(surface) = self.pointer_surface {
+                    self.track_pointer(surface, surface_x, surface_y);
+                }
+
+                self.show_cursor(client);
+            }
+            Event::PointerButton { button, state, .. } => {
+                if button == BUTTON_LEFT && state == ButtonState::Pressed {
+                    self.press();
+                }
+            }
+            Event::PointerLeave { .. } => {
+                self.pointer_surface = None;
+                self.cursor_visible = false;
+            }
+            Event::BufferRelease { buffer } => self.release_buffer(buffer),
+            Event::CallbackDone { callback, .. } => {
+                if self.frame_callback == Some(callback) {
+                    self.frame_callback = None;
+                    self.frame_ready = true;
+                }
+            }
+            Event::XdgWmBasePing { wm_base, serial } => {
+                client.xdg_wm_base_pong(wm_base, serial).expect("pong failed");
+            }
+            Event::XdgSurfaceConfigure { xdg_surface, serial } => {
+                client
+                    .xdg_surface_ack_configure(xdg_surface, serial)
+                    .expect("configure ack failed");
+                self.configure_pending = true;
+            }
+            Event::XdgToplevelConfigure { width, height, .. } => {
+                self.requested_size = Some((width as u32, height as u32));
+                self.configure_pending = true;
+            }
+            Event::XdgToplevelClose { .. } => exit_group(0),
+            Event::OutputMode { width, height, .. } => {
+                self.output_size = Some((width as u32, height as u32));
+            }
+            Event::OutputScale { factor, .. } => self.set_scale(client, factor),
+            Event::DisplayError { object_id, interface, code, message } => panic!(
+                "wayland display error: object {object_id} interface {interface:?} code {code}: {message}"
+            ),
+            _ => {}
+        }
+    }
+
+    fn tick(&mut self, client: &mut Client) {
         if self.configure_pending {
-            self.apply_configure();
+            self.apply_configure(client);
         }
 
         let local = civil::now();
@@ -251,17 +364,18 @@ impl App {
         }
 
         if self.display.page == Page::PoweringOff {
-            let dots = (self.dots_started.elapsed().as_millis() / DOTS_INTERVAL.as_millis()) % 4;
+            let dots = ((civil::monotonic_milliseconds() - self.dots_started) / DOTS_INTERVAL) as usize % 4;
 
-            if dots as usize != self.display.dots {
-                self.display.dots = dots as usize;
+            if dots != self.display.dots {
+                self.display.dots = dots;
                 self.content_dirty = true;
             }
         }
 
         let battery_changed = self.battery_events.power_supply_changed();
+        let now = civil::monotonic_milliseconds();
 
-        if battery_changed || self.battery_checked.elapsed() >= BATTERY_REFRESH_INTERVAL {
+        if battery_changed || now - self.battery_checked >= BATTERY_REFRESH_INTERVAL {
             self.refresh_battery();
         }
 
@@ -274,12 +388,12 @@ impl App {
             self.battery_dirty = true;
         }
 
-        self.hide_idle_cursor();
+        self.hide_idle_cursor(client);
 
         if let Some(deadline) = self.power_off_at {
-            if Instant::now() >= deadline {
+            if now >= deadline {
                 self.power_off_at = None;
-                Command::new("systemctl").arg("poweroff").status().expect("systemctl is required");
+                power_off();
             }
         }
     }
@@ -289,17 +403,13 @@ impl App {
         let percentage = state.as_ref().map(|battery| battery.percentage);
         let charging = state.as_ref().map_or(false, |battery| battery.charging);
 
-        if std::env::var_os("DAYLIGHT_CLOCK_DEBUG").is_some() {
-            eprintln!("battery percentage={percentage:?} charging={charging}");
-        }
-
         if percentage != self.display.battery || charging != self.display.charging {
             self.display.battery = percentage;
             self.display.charging = charging;
             self.battery_dirty = true;
         }
 
-        self.battery_checked = Instant::now();
+        self.battery_checked = civil::monotonic_milliseconds();
     }
 
     fn mark_all_dirty(&mut self) {
@@ -308,7 +418,7 @@ impl App {
         self.battery_dirty = true;
     }
 
-    fn apply_configure(&mut self) {
+    fn apply_configure(&mut self, client: &mut Client) {
         self.configure_pending = false;
 
         let logical_size = match self.requested_size {
@@ -321,22 +431,28 @@ impl App {
 
         self.logical_size = logical_size;
 
-        self.viewport.set_source(0.0, 0.0, 1.0, 1.0);
-        self.viewport
-            .set_destination(logical_size.0 as i32, logical_size.1 as i32);
+        client
+            .viewport_set_source(self.viewport, 0.0, 0.0, 1.0, 1.0)
+            .expect("viewport source failed");
+        client
+            .viewport_set_destination(self.viewport, logical_size.0 as i32, logical_size.1 as i32)
+            .expect("viewport destination failed");
 
-        self.parent_input.destroy();
-        self.parent_input = self.compositor.create_region(&self.queue_handle, ());
-        self.parent_input
-            .add(0, 0, logical_size.0 as i32, logical_size.1 as i32);
-        self.parent.set_input_region(Some(&self.parent_input));
+        client.region_destroy(self.parent_input).expect("region destroy failed");
+        self.parent_input = client.compositor_create_region(self.compositor).expect("region creation failed");
+        client
+            .region_add(self.parent_input, 0, 0, logical_size.0 as i32, logical_size.1 as i32)
+            .expect("region add failed");
+        client
+            .surface_set_input_region(self.parent, Some(self.parent_input))
+            .expect("input region failed");
 
-        self.place_layers();
+        self.place_layers(client);
         self.configured = true;
         self.mark_all_dirty();
     }
 
-    fn place_layers(&mut self) {
+    fn place_layers(&mut self, client: &mut Client) {
         let scale = self.scale as f32;
         let (width, height) = self.logical_size;
 
@@ -346,36 +462,30 @@ impl App {
             ((height - content.1 / scale) / 2.0).round() as i32,
         );
 
-        self.content.set_position(content_origin);
+        self.content.set_position(client, content_origin);
 
         match scene::battery_size(&self.display, scale, &mut self.text) {
             Some(battery) => {
                 let origin = (0, (height - battery.1 / scale).round() as i32);
-                self.battery_layer.set_position(origin);
+                self.battery_layer.set_position(client, origin);
             }
-            None => self.battery_layer.unmap(),
+            None => self.battery_layer.unmap(client),
         }
     }
 
-    fn render(&mut self) {
+    fn render(&mut self, client: &mut Client) {
         if !self.configured || !self.frame_ready {
             return;
         }
 
         if self.content_dirty || self.battery_dirty {
-            self.place_layers();
+            self.place_layers(client);
         }
 
         let mut painted = false;
 
         if self.background_dirty {
-            let color = self.background_color;
-            let shm = self.shm.clone();
-            let queue_handle = self.queue_handle.clone();
-            let surface = &self.background.surface;
-            let buffer = &mut self.background.buffer;
-
-            painted |= paint_background(surface, buffer, &shm, &queue_handle, color);
+            painted |= paint_background(client, self.shm, &mut self.background, self.background_color);
             self.background_dirty = false;
         }
 
@@ -383,7 +493,7 @@ impl App {
             let scale = self.scale as f32;
             let size = scene::content_size(&self.display, scale, &mut self.text);
 
-            let drawn = self.content.paint(&self.shm, &self.queue_handle, size, |canvas| {
+            let drawn = self.content.paint(client, self.shm, size, |canvas| {
                 scene::draw_content(
                     canvas,
                     &self.display,
@@ -403,7 +513,7 @@ impl App {
 
             match scene::battery_size(&self.display, scale, &mut self.text) {
                 Some(size) => {
-                    let drawn = self.battery_layer.paint(&self.shm, &self.queue_handle, size, |canvas| {
+                    let drawn = self.battery_layer.paint(client, self.shm, size, |canvas| {
                         scene::draw_battery(
                             canvas,
                             &self.display,
@@ -418,66 +528,66 @@ impl App {
                     painted |= drawn;
                 }
                 None => {
-                    self.battery_layer.unmap();
+                    self.battery_layer.unmap(client);
                     self.battery_dirty = false;
                 }
             }
         }
 
         if painted {
-            self.frame_callback = Some(self.parent.frame(&self.queue_handle, ()));
-            self.parent.commit();
+            self.frame_callback = Some(client.surface_frame(self.parent).expect("frame callback failed"));
+            client.surface_commit(self.parent).expect("parent commit failed");
             self.frame_ready = false;
         }
     }
 
-    fn hide_idle_cursor(&mut self) {
-        if !self.cursor_visible || Instant::now() < self.cursor_idle_deadline {
+    fn hide_idle_cursor(&mut self, client: &mut Client) {
+        if !self.cursor_visible || civil::monotonic_milliseconds() < self.cursor_idle_deadline {
             return;
         }
 
-        if let Some(pointer) = &self.pointer {
-            pointer.set_cursor(self.cursor_serial, None, 0, 0);
+        if let Some(pointer) = self.pointer {
+            client
+                .pointer_set_cursor(pointer, self.cursor_serial, None, 0, 0)
+                .expect("cursor hide failed");
         }
 
         self.cursor_visible = false;
     }
 
-    fn show_cursor(&mut self) {
-        let Some(pointer) = &self.pointer else {
+    fn show_cursor(&mut self, client: &mut Client) {
+        let Some(pointer) = self.pointer else {
             return;
         };
 
-        pointer.set_cursor(
-            self.cursor_serial,
-            Some(&self.cursor.surface),
-            self.cursor.hotspot.0,
-            self.cursor.hotspot.1,
-        );
+        client
+            .pointer_set_cursor(
+                pointer,
+                self.cursor_serial,
+                Some(self.cursor.surface),
+                self.cursor.hotspot.0,
+                self.cursor.hotspot.1,
+            )
+            .expect("cursor show failed");
 
         self.cursor_visible = true;
-        self.cursor_idle_deadline = Instant::now() + CURSOR_IDLE_DELAY;
+        self.cursor_idle_deadline = civil::monotonic_milliseconds() + CURSOR_IDLE_DELAY;
     }
 
-    fn track_pointer(&mut self, surface: wl_surface::WlSurface, x: f32, y: f32) {
-        let on_content = surface == self.content.surface;
-
-        if on_content {
+    fn track_pointer(&mut self, surface: WlSurface, x: f32, y: f32) {
+        if surface == self.content.surface {
             self.pointer_point = (x, y);
+        } else if surface == self.parent {
+            self.pointer_point = (
+                x - self.content.position.0 as f32,
+                y - self.content.position.1 as f32,
+            );
         }
 
         self.pointer_surface = Some(surface);
     }
 
-    fn pointer_on_content(&self) -> bool {
-        self.pointer_surface.as_ref() == Some(&self.content.surface)
-    }
-
     fn press(&mut self) {
-        if !self.pointer_on_content() {
-            return;
-        }
-
         let action = scene::action_at(&self.display, self.pointer_point, &mut self.text);
 
         match action {
@@ -491,10 +601,11 @@ impl App {
             }
             Some(Action::PowerOff) => {
                 if self.display.page != Page::PoweringOff {
+                    let now = civil::monotonic_milliseconds();
                     self.display.page = Page::PoweringOff;
                     self.display.dots = 0;
-                    self.dots_started = Instant::now();
-                    self.power_off_at = Some(Instant::now() + POWER_OFF_DELAY);
+                    self.dots_started = now;
+                    self.power_off_at = Some(now + POWER_OFF_DELAY);
                     self.content_dirty = true;
                 }
             }
@@ -502,55 +613,66 @@ impl App {
         }
     }
 
-    fn set_scale(&mut self, scale: i32) {
+    fn set_scale(&mut self, client: &mut Client, scale: i32) {
         if scale == self.scale {
             return;
         }
 
         self.scale = scale;
-        self.cursor = Cursor::new(&self.compositor, &self.shm, &self.queue_handle, scale);
-        self.content.set_scale(scale);
-        self.battery_layer.set_scale(scale);
+        self.cursor = Cursor::new(client, self.compositor, self.shm, scale);
+        self.content.set_scale(client, scale);
+        self.battery_layer.set_scale(client, scale);
         self.configure_pending = true;
     }
 
-    fn release_slot(&mut self, slot: usize) {
-        match slot {
-            CURSOR_SLOT => self.cursor.buffer.busy = false,
-            BACKGROUND_SLOT => self.background.buffer.busy = false,
-            CONTENT_SLOT => {
-                if let Some(buffer) = self.content.buffer.as_mut() {
-                    buffer.busy = false;
-                }
+    fn release_buffer(&mut self, buffer: WlBuffer) {
+        if self.cursor.buffer.buffer == buffer {
+            self.cursor.buffer.busy = false;
+        } else if self.background.buffer.buffer == buffer {
+            self.background.buffer.busy = false;
+        } else if let Some(layer_buffer) = self.content.buffer.as_mut() {
+            if layer_buffer.buffer == buffer {
+                layer_buffer.busy = false;
             }
-            BATTERY_SLOT => {
-                if let Some(buffer) = self.battery_layer.buffer.as_mut() {
-                    buffer.busy = false;
-                }
+        } else if let Some(layer_buffer) = self.battery_layer.buffer.as_mut() {
+            if layer_buffer.buffer == buffer {
+                layer_buffer.busy = false;
             }
-            _ => {}
         }
     }
 }
 
+fn bind<T: ObjectId>(client: &mut Client, maximum: u32) -> T {
+    let interface = T::interface().name();
+    let version = client
+        .global(interface)
+        .map(|global| global.version.min(maximum))
+        .expect("required wayland global is missing");
+
+    client.bind::<T>(version).expect("wayland global bind failed")
+}
+
 impl Layer {
     fn new(
-        parent: &wl_surface::WlSurface,
-        compositor: &wl_compositor::WlCompositor,
-        subcompositor: &wl_subcompositor::WlSubcompositor,
-        queue_handle: &QueueHandle<App>,
-        slot: usize,
+        client: &mut Client,
+        compositor: WlCompositor,
+        subcompositor: WlSubcompositor,
+        parent: WlSurface,
         ignore_input: bool,
     ) -> Self {
-        let surface = compositor.create_surface(queue_handle, ());
-        let subsurface = subcompositor.get_subsurface(&surface, parent, queue_handle, ());
+        let surface = client.compositor_create_surface(compositor).expect("surface creation failed");
+        let subsurface = client
+            .subcompositor_get_subsurface(subcompositor, surface, parent)
+            .expect("subsurface creation failed");
 
-        subsurface.set_desync();
+        client.subsurface_set_desync(subsurface).expect("desync failed");
 
         if ignore_input {
-            let region = compositor.create_region(queue_handle, ());
-            surface.set_input_region(Some(&region));
-            region.destroy();
+            let region = client.compositor_create_region(compositor).expect("region creation failed");
+            client
+                .surface_set_input_region(surface, Some(region))
+                .expect("input region failed");
+            client.region_destroy(region).expect("region destroy failed");
         }
 
         Self {
@@ -559,41 +681,42 @@ impl Layer {
             buffer: None,
             position: (0, 0),
             mapped: false,
-            slot,
             scale: 1,
         }
     }
 
-    fn set_scale(&mut self, scale: i32) {
+    fn set_scale(&mut self, client: &mut Client, scale: i32) {
         self.scale = scale;
-        self.surface.set_buffer_scale(scale);
-        self.surface.commit();
+        client.surface_set_buffer_scale(self.surface, scale).expect("buffer scale failed");
+        client.surface_commit(self.surface).expect("surface commit failed");
     }
 
-    fn set_position(&mut self, position: (i32, i32)) {
+    fn set_position(&mut self, client: &mut Client, position: (i32, i32)) {
         if self.position == position {
             return;
         }
 
         self.position = position;
-        self.subsurface.set_position(position.0, position.1);
-        self.surface.commit();
+        client
+            .subsurface_set_position(self.subsurface, position.0, position.1)
+            .expect("subsurface position failed");
+        client.surface_commit(self.surface).expect("surface commit failed");
     }
 
-    fn unmap(&mut self) {
+    fn unmap(&mut self, client: &mut Client) {
         if !self.mapped {
             return;
         }
 
-        self.surface.attach(None, 0, 0);
-        self.surface.commit();
+        client.surface_attach(self.surface, None, 0, 0).expect("surface attach failed");
+        client.surface_commit(self.surface).expect("surface commit failed");
         self.mapped = false;
     }
 
     fn paint(
         &mut self,
-        shm: &wl_shm::WlShm,
-        queue_handle: &QueueHandle<App>,
+        client: &mut Client,
+        shm: WlShm,
         size: (f32, f32),
         paint: impl FnOnce(&mut Canvas),
     ) -> bool {
@@ -604,7 +727,7 @@ impl Layer {
             Some(buffer) if buffer.width == width && buffer.height == height => buffer,
             _ => self
                 .buffer
-                .insert(Buffers::new(shm, queue_handle, width, height, self.slot, wl_shm::Format::Xrgb8888)),
+                .insert(Buffers::new(client, shm, width, height, ShmFormat::Xrgb8888)),
         };
 
         if buffer.busy {
@@ -616,10 +739,16 @@ impl Layer {
             paint(&mut Canvas::new(pixels, width, height));
         }
 
-        self.surface.set_buffer_scale(self.scale);
-        self.surface.attach(Some(&buffer.buffer), 0, 0);
-        self.surface.damage_buffer(0, 0, width, height);
-        self.surface.commit();
+        client
+            .surface_set_buffer_scale(self.surface, self.scale)
+            .expect("buffer scale failed");
+        client
+            .surface_attach(self.surface, Some(buffer.buffer), 0, 0)
+            .expect("surface attach failed");
+        client
+            .surface_damage_buffer(self.surface, 0, 0, width, height)
+            .expect("surface damage failed");
+        client.surface_commit(self.surface).expect("surface commit failed");
 
         buffer.busy = true;
         buffer.drop_resident_pages();
@@ -629,240 +758,56 @@ impl Layer {
     }
 }
 
-fn paint_background(
-    surface: &wl_surface::WlSurface,
-    buffer: &mut Buffers,
-    shm: &wl_shm::WlShm,
-    queue_handle: &QueueHandle<App>,
-    color: canvas::Color,
-) -> bool {
-    if buffer.busy {
+fn paint_background(client: &mut Client, shm: WlShm, background: &mut Background, color: canvas::Color) -> bool {
+    if background.buffer.busy {
         return false;
     }
 
-    if (buffer.width, buffer.height) != (1, 1) {
-        *buffer = Buffers::new(shm, queue_handle, 1, 1, BACKGROUND_SLOT, wl_shm::Format::Xrgb8888);
+    if (background.buffer.width, background.buffer.height) != (1, 1) {
+        background.buffer = Buffers::new(client, shm, 1, 1, ShmFormat::Xrgb8888);
     }
 
-    let pixels = buffer.pixels();
+    let pixels = background.buffer.pixels();
     Canvas::new(pixels, 1, 1).clear(color);
 
-    surface.attach(Some(&buffer.buffer), 0, 0);
-    surface.damage_buffer(0, 0, 1, 1);
-    buffer.busy = true;
-    buffer.drop_resident_pages();
+    client
+        .surface_attach(background.surface, Some(background.buffer.buffer), 0, 0)
+        .expect("background attach failed");
+    client
+        .surface_damage_buffer(background.surface, 0, 0, 1, 1)
+        .expect("background damage failed");
+    background.buffer.busy = true;
+    background.buffer.drop_resident_pages();
 
     true
 }
 
-impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for App {
-    fn event(
-        _: &mut Self,
-        _: &wl_registry::WlRegistry,
-        _: wl_registry::Event,
-        _: &GlobalListContents,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-impl Dispatch<wl_seat::WlSeat, ()> for App {
-    fn event(
-        state: &mut Self,
-        seat: &wl_seat::WlSeat,
-        event: wl_seat::Event,
-        _: &(),
-        _: &Connection,
-        queue_handle: &QueueHandle<Self>,
-    ) {
-        if let wl_seat::Event::Capabilities { capabilities } = event {
-            let capabilities = capabilities.into_result().unwrap();
-
-            if capabilities.contains(wl_seat::Capability::Pointer) && state.pointer.is_none() {
-                state.pointer = Some(seat.get_pointer(queue_handle, ()));
-            }
-        }
-    }
-}
-
-impl Dispatch<wl_pointer::WlPointer, ()> for App {
-    fn event(
-        state: &mut Self,
-        _: &wl_pointer::WlPointer,
-        event: wl_pointer::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        match event {
-            wl_pointer::Event::Enter { serial, surface, surface_x, surface_y } => {
-                state.cursor_serial = serial;
-                state.track_pointer(surface, surface_x as f32, surface_y as f32);
-                state.show_cursor();
-            }
-            wl_pointer::Event::Motion { surface_x, surface_y, .. } => {
-                if let Some(surface) = state.pointer_surface.clone() {
-                    state.track_pointer(surface, surface_x as f32, surface_y as f32);
-                }
-
-                state.show_cursor();
-            }
-            wl_pointer::Event::Button { button, state: button_state, .. } => {
-                if button == BUTTON_LEFT && button_state.into_result().unwrap() == wl_pointer::ButtonState::Pressed {
-                    state.press();
-                }
-            }
-            wl_pointer::Event::Leave { .. } => {
-                state.pointer_surface = None;
-                state.cursor_visible = false;
-            }
-            _ => {}
-        }
-    }
-}
-
-impl Dispatch<wl_buffer::WlBuffer, usize> for App {
-    fn event(
-        state: &mut Self,
-        _: &wl_buffer::WlBuffer,
-        event: wl_buffer::Event,
-        slot: &usize,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let wl_buffer::Event::Release = event {
-            state.release_slot(*slot);
-        }
-    }
-}
-
-impl Dispatch<wl_callback::WlCallback, ()> for App {
-    fn event(
-        state: &mut Self,
-        _: &wl_callback::WlCallback,
-        event: wl_callback::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let wl_callback::Event::Done { .. } = event {
-            state.frame_ready = true;
-        }
-    }
-}
-
-impl Dispatch<xdg_wm_base::XdgWmBase, ()> for App {
-    fn event(
-        _: &mut Self,
-        wm_base: &xdg_wm_base::XdgWmBase,
-        event: xdg_wm_base::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let xdg_wm_base::Event::Ping { serial } = event {
-            wm_base.pong(serial);
-        }
-    }
-}
-
-impl Dispatch<xdg_surface::XdgSurface, ()> for App {
-    fn event(
-        state: &mut Self,
-        xdg_surface: &xdg_surface::XdgSurface,
-        event: xdg_surface::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let xdg_surface::Event::Configure { serial } = event {
-            xdg_surface.ack_configure(serial);
-            state.configure_pending = true;
-        }
-    }
-}
-
-impl Dispatch<xdg_toplevel::XdgToplevel, ()> for App {
-    fn event(
-        state: &mut Self,
-        _: &xdg_toplevel::XdgToplevel,
-        event: xdg_toplevel::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        match event {
-            xdg_toplevel::Event::Configure { width, height, .. } => {
-                state.requested_size = Some((width as u32, height as u32));
-                state.configure_pending = true;
-            }
-            xdg_toplevel::Event::Close => std::process::exit(0),
-            _ => {}
-        }
-    }
-}
-
-impl Dispatch<wl_output::WlOutput, ()> for App {
-    fn event(
-        state: &mut Self,
-        _: &wl_output::WlOutput,
-        event: wl_output::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        match event {
-            wl_output::Event::Mode { width, height, .. } => {
-                state.output_size = Some((width as u32, height as u32));
-            }
-            wl_output::Event::Scale { factor } => state.set_scale(factor),
-            _ => {}
-        }
-    }
-}
-
-delegate_noop!(App: ignore wl_compositor::WlCompositor);
-delegate_noop!(App: ignore wl_surface::WlSurface);
-delegate_noop!(App: ignore wl_shm::WlShm);
-delegate_noop!(App: ignore wl_shm_pool::WlShmPool);
-delegate_noop!(App: ignore wl_region::WlRegion);
-delegate_noop!(App: ignore wl_subcompositor::WlSubcompositor);
-delegate_noop!(App: ignore wl_subsurface::WlSubsurface);
-delegate_noop!(App: ignore wp_viewporter::WpViewporter);
-delegate_noop!(App: ignore wp_viewport::WpViewport);
-
 struct Buffers {
-    _file: File,
-    _pool: wl_shm_pool::WlShmPool,
+    _pool: WlShmPool,
     mapping: MmapMut,
-    buffer: wl_buffer::WlBuffer,
+    buffer: WlBuffer,
     busy: bool,
     width: i32,
     height: i32,
 }
 
 impl Buffers {
-    fn new(
-        shm: &wl_shm::WlShm,
-        queue_handle: &QueueHandle<App>,
-        width: i32,
-        height: i32,
-        slot: usize,
-        format: wl_shm::Format,
-    ) -> Self {
+    fn new(client: &mut Client, shm: WlShm, width: i32, height: i32, format: ShmFormat) -> Self {
         let stride = width * 4;
         let bytes = (stride * height) as usize;
 
-        let file = File::from(memfd_create("daylight-clock", MemfdFlags::CLOEXEC).unwrap());
-        file.set_len(bytes as u64).unwrap();
+        let file = memfd_create("daylight-clock", MemfdFlags::CLOEXEC).expect("memfd creation failed");
+        ftruncate(&file, bytes as u64).expect("memfd resize failed");
 
-        let mapping = unsafe { MmapMut::map_mut(&file) }.unwrap();
-        let pool = shm.create_pool(file.as_fd(), bytes as i32, queue_handle, ());
-        let buffer = pool.create_buffer::<usize, App>(0, width, height, stride, format.into(), queue_handle, slot);
+        let mapping = MmapMut::map_mut(file.as_fd(), bytes).expect("buffer mapping failed");
+        let pool = client
+            .shm_create_pool(shm, file.as_fd(), bytes as i32)
+            .expect("shm pool creation failed");
+        let buffer = client
+            .shm_pool_create_buffer(pool, 0, width, height, stride, format)
+            .expect("shm buffer creation failed");
 
         Self {
-            _file: file,
             _pool: pool,
             mapping,
             buffer,
@@ -872,26 +817,19 @@ impl Buffers {
         }
     }
 
-    fn drop_resident_pages(&mut self) {
-        unsafe {
-            rustix::mm::madvise(
-                self.mapping.as_mut_ptr().cast(),
-                self.mapping.len(),
-                rustix::mm::Advice::LinuxDontNeed,
-            )
-        }
-        .unwrap();
+    fn drop_resident_pages(&self) {
+        self.mapping.drop_resident_pages().expect("madvise failed");
     }
 
     fn pixels(&mut self) -> &mut [u32] {
         let count = self.width as usize * self.height as usize;
 
-        unsafe { std::slice::from_raw_parts_mut(self.mapping.as_mut_ptr().cast::<u32>(), count) }
+        unsafe { core::slice::from_raw_parts_mut(self.mapping.as_mut_ptr().cast::<u32>(), count) }
     }
 }
 
 struct Cursor {
-    surface: wl_surface::WlSurface,
+    surface: WlSurface,
     buffer: Buffers,
     hotspot: (i32, i32),
 }
@@ -899,23 +837,24 @@ struct Cursor {
 impl Cursor {
     const LOGICAL_SIZE: (i32, i32) = (14, 22);
 
-    fn new(
-        compositor: &wl_compositor::WlCompositor,
-        shm: &wl_shm::WlShm,
-        queue_handle: &QueueHandle<App>,
-        scale: i32,
-    ) -> Self {
+    fn new(client: &mut Client, compositor: WlCompositor, shm: WlShm, scale: i32) -> Self {
         let width = Self::LOGICAL_SIZE.0 * scale;
         let height = Self::LOGICAL_SIZE.1 * scale;
-        let mut buffer = Buffers::new(shm, queue_handle, width, height, CURSOR_SLOT, wl_shm::Format::Argb8888);
+        let mut buffer = Buffers::new(client, shm, width, height, ShmFormat::Argb8888);
 
         draw_cursor(buffer.pixels(), width, height, scale);
 
-        let surface = compositor.create_surface(queue_handle, ());
-        surface.set_buffer_scale(scale);
-        surface.attach(Some(&buffer.buffer), 0, 0);
-        surface.damage_buffer(0, 0, width, height);
-        surface.commit();
+        let surface = client.compositor_create_surface(compositor).expect("cursor surface failed");
+        client
+            .surface_set_buffer_scale(surface, scale)
+            .expect("cursor scale failed");
+        client
+            .surface_attach(surface, Some(buffer.buffer), 0, 0)
+            .expect("cursor attach failed");
+        client
+            .surface_damage_buffer(surface, 0, 0, width, height)
+            .expect("cursor damage failed");
+        client.surface_commit(surface).expect("cursor commit failed");
 
         buffer.busy = true;
 
@@ -932,7 +871,10 @@ fn draw_cursor(pixels: &mut [u32], width: i32, height: i32, scale: i32) {
     let logical_scale = scale as f32;
     let edge_width = 1.0 * logical_scale;
 
-    let points: Vec<(f32, f32)> = outline.iter().map(|(x, y)| (x * logical_scale, y * logical_scale)).collect();
+    let points: Vec<(f32, f32)> = outline
+        .iter()
+        .map(|(x, y)| (x * logical_scale, y * logical_scale))
+        .collect();
 
     for y in 0..height {
         for x in 0..width {
@@ -1015,4 +957,146 @@ fn distance_to_segment(x: f32, y: f32, start: (f32, f32), end: (f32, f32)) -> f3
     let closest = (start.0 + projection * segment.0, start.1 + projection * segment.1);
 
     ((x - closest.0).powi(2) + (y - closest.1).powi(2)).sqrt()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memcpy(destination: *mut c_void, source: *const c_void, count: usize) -> *mut c_void {
+    let destination = destination.cast::<u8>();
+    let source = source.cast::<u8>();
+    let mut index = 0;
+
+    while index < count {
+        core::ptr::write_volatile(destination.add(index), core::ptr::read_volatile(source.add(index)));
+        index += 1;
+    }
+
+    destination.cast()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memmove(destination: *mut c_void, source: *const c_void, count: usize) -> *mut c_void {
+    let destination = destination.cast::<u8>();
+    let source = source.cast::<u8>();
+
+    if (destination as usize) < (source as usize) {
+        memcpy(destination.cast(), source.cast(), count)
+    } else {
+        let mut index = count;
+
+        while index > 0 {
+            index -= 1;
+            core::ptr::write_volatile(destination.add(index), core::ptr::read_volatile(source.add(index)));
+        }
+
+        destination.cast()
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memset(destination: *mut c_void, value: i32, count: usize) -> *mut c_void {
+    let destination = destination.cast::<u8>();
+    let byte = value as u8;
+    let mut index = 0;
+
+    while index < count {
+        core::ptr::write_volatile(destination.add(index), byte);
+        index += 1;
+    }
+
+    destination.cast()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bcmp(first: *const c_void, second: *const c_void, count: usize) -> i32 {
+    let first = first.cast::<u8>();
+    let second = second.cast::<u8>();
+    let mut index = 0;
+
+    while index < count {
+        let difference = core::ptr::read_volatile(first.add(index)).wrapping_sub(core::ptr::read_volatile(second.add(index)));
+
+        if difference != 0 {
+            return difference as i32;
+        }
+
+        index += 1;
+    }
+
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn strlen(text: *const i8) -> usize {
+    let text = text.cast::<u8>();
+    let mut length = 0;
+
+    while core::ptr::read_volatile(text.add(length)) != 0 {
+        length += 1;
+    }
+
+    length
+}
+
+#[no_mangle]
+extern "C" fn rust_eh_personality() {}
+
+#[no_mangle]
+extern "C" fn _Unwind_Resume() -> ! {
+    exit_group(134)
+}
+
+fn power_off() -> ! {
+    let program_name = b"systemctl\0";
+    let power_off_argument = b"poweroff\0";
+    let arguments = [
+        program_name.as_ptr(),
+        power_off_argument.as_ptr(),
+        core::ptr::null(),
+    ];
+    let environment = [core::ptr::null()];
+
+    for path in SYSTEMCTL_PATHS {
+        let path = unsafe { core::ffi::CStr::from_bytes_with_nul_unchecked(path) };
+        unsafe {
+            let _ = execve(path, arguments.as_ptr(), environment.as_ptr());
+        }
+    }
+
+    exit_group(1)
+}
+
+struct StackMessage {
+    bytes: [u8; 512],
+    length: usize,
+}
+
+impl StackMessage {
+    fn new() -> Self {
+        Self {
+            bytes: [0; 512],
+            length: 0,
+        }
+    }
+}
+
+impl core::fmt::Write for StackMessage {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        let remaining = self.bytes.len() - self.length;
+        let take = text.len().min(remaining);
+
+        self.bytes[self.length..self.length + take].copy_from_slice(&text.as_bytes()[..take]);
+        self.length += take;
+
+        Ok(())
+    }
+}
+
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    let mut message = StackMessage::new();
+    let _ = write!(&mut message, "daylight-clock panic: {info}\n");
+    unsafe {
+        let _ = rustix::io::write(rustix::stdio::stderr(), &message.bytes[..message.length]);
+    }
+    exit_group(101)
 }

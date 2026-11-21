@@ -1,3 +1,7 @@
+use alloc::format;
+use alloc::string::String;
+use rustix::time::{clock_gettime, ClockId};
+
 pub const BUENOS_AIRES_OFFSET_SECONDS: i64 = -3 * 3600;
 
 pub struct LocalTime {
@@ -11,10 +15,8 @@ pub struct LocalTime {
 }
 
 pub fn now() -> LocalTime {
-    let unix_milliseconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
+    let timestamp = clock_gettime(ClockId::Realtime);
+    let unix_milliseconds = timestamp.tv_sec * 1000 + timestamp.tv_nsec / 1_000_000;
 
     from_unix_milliseconds(unix_milliseconds)
 }
@@ -71,4 +73,9 @@ pub fn day_of_year(year: i32, month: u32, day: u32) -> u32 {
 
 fn is_leap_year(year: i32) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+pub fn monotonic_milliseconds() -> f64 {
+    let timestamp = clock_gettime(ClockId::Monotonic);
+    timestamp.tv_sec as f64 * 1000.0 + timestamp.tv_nsec as f64 / 1_000_000.0
 }

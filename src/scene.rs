@@ -1,6 +1,11 @@
 use crate::canvas::{difference, Canvas, Color, Rect};
 use crate::solar::SunTimes;
 use crate::text::Text;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+use core_maths::CoreFloat;
 
 const DAYLIGHT_KELVIN: f64 = 6500.0;
 const NIGHT_COLOR: Color = [0, 0, 0];
@@ -458,7 +463,7 @@ fn draw_power_icon(canvas: &mut Canvas, icon: Rect, ink: Color) {
     let radius = 9.0 * unit;
     let thickness = 1.9 * unit;
     let gap_half_angle = 32.0_f32.to_radians();
-    let top_angle = -std::f32::consts::FRAC_PI_2;
+    let top_angle = -core::f32::consts::FRAC_PI_2;
 
     let bounds = Rect::new(
         center.0 - radius - thickness,
@@ -495,8 +500,8 @@ fn draw_back_icon(canvas: &mut Canvas, icon: Rect, ink: Color) {
 }
 
 fn angular_distance(first: f32, second: f32) -> f32 {
-    let difference = (first - second).abs() % std::f32::consts::TAU;
-    difference.min(std::f32::consts::TAU - difference)
+    let difference = (first - second).abs() % core::f32::consts::TAU;
+    difference.min(core::f32::consts::TAU - difference)
 }
 
 fn inside_polygon(x: f32, y: f32, points: &[(f32, f32)]) -> bool {

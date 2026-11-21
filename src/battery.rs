@@ -1,15 +1,20 @@
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core_maths::CoreFloat;
+use rustix::fd::OwnedFd;
+use rustix::fs::{open, Dir, Mode, OFlags};
 use rustix::io::{read as read_fd, Errno};
 use rustix::net::netlink::{SocketAddrNetlink, KOBJECT_UEVENT};
 use rustix::net::{bind, socket_with, AddressFamily, SocketFlags, SocketType};
-use std::os::fd::OwnedFd;
-use std::path::Path;
+
+const POWER_SUPPLY: &str = "/sys/class/power_supply";
+const UEVENT_MULTICAST_GROUP: u32 = 1;
 
 pub struct Battery {
     pub percentage: u8,
     pub charging: bool,
 }
-
-const UEVENT_MULTICAST_GROUP: u32 = 1;
 
 pub struct Events {
     socket: OwnedFd,
@@ -52,10 +57,6 @@ impl Events {
     }
 }
 
-fn debug_enabled() -> bool {
-    std::env::var_os("DAYLIGHT_CLOCK_DEBUG").is_some()
-}
-
 fn mentions_power_supply(message: &[u8]) -> bool {
     message
         .split(|byte| *byte == 0)
@@ -63,49 +64,40 @@ fn mentions_power_supply(message: &[u8]) -> bool {
 }
 
 pub fn read() -> Option<Battery> {
-    let supplies = std::fs::read_dir("/sys/class/power_supply").ok()?;
     let mut chosen: Option<(Battery, bool)> = None;
 
-    for supply in supplies.flatten() {
-        let path = supply.path();
+    for name in supply_names() {
+        let directory = format!("{POWER_SUPPLY}/{name}");
 
-        if debug_enabled() {
-            eprintln!(
-                "{path:?} type={:?} scope={:?} present={:?} status={:?} online={:?} capacity={:?}",
-                read_trimmed(&path.join("type")),
-                read_trimmed(&path.join("scope")),
-                read_trimmed(&path.join("present")),
-                read_trimmed(&path.join("status")),
-                read_trimmed(&path.join("online")),
-                read_trimmed(&path.join("capacity")),
-            );
-        }
-
-        if read_trimmed(&path.join("type")).as_deref() != Some("Battery") {
+        if read_trimmed(&format!("{directory}/type")).as_deref() != Some("Battery") {
             continue;
         }
 
-        if read_trimmed(&path.join("present")).as_deref() == Some("0") {
+        if read_trimmed(&format!("{directory}/present")).as_deref() == Some("0") {
             continue;
         }
 
-        let Some(percentage) = read_capacity(&path) else {
+        let Some(percentage) = read_capacity(&directory) else {
             continue;
         };
 
-        let system_scope = read_trimmed(&path.join("scope")).as_deref() == Some("System");
-        let improves = chosen.as_ref().is_none_or(|(_, current_is_system)| system_scope && !current_is_system);
+        let system_scope = read_trimmed(&format!("{directory}/scope")).as_deref() == Some("System");
+        let improves = match &chosen {
+            None => true,
+            Some((_, current_is_system)) => system_scope && !current_is_system,
+        };
 
         if improves {
-            chosen = Some((Battery { percentage, charging: is_charging(&path) }, system_scope));
+            let charging = is_charging(&directory);
+            chosen = Some((Battery { percentage, charging }, system_scope));
         }
     }
 
     chosen.map(|(battery, _)| battery)
 }
 
-fn is_charging(path: &Path) -> bool {
-    match read_trimmed(&path.join("status")).as_deref() {
+fn is_charging(directory: &str) -> bool {
+    match read_trimmed(&format!("{directory}/status")).as_deref() {
         Some("Charging") | Some("Not charging") | Some("Full") => true,
         Some("Discharging") => false,
         _ => external_power_online(),
@@ -113,29 +105,46 @@ fn is_charging(path: &Path) -> bool {
 }
 
 fn external_power_online() -> bool {
-    let Ok(supplies) = std::fs::read_dir("/sys/class/power_supply") else {
-        return false;
-    };
-
-    supplies
-        .flatten()
-        .any(|supply| read_trimmed(&supply.path().join("online")).as_deref() == Some("1"))
+    supply_names()
+        .iter()
+        .any(|name| read_trimmed(&format!("{POWER_SUPPLY}/{name}/online")).as_deref() == Some("1"))
 }
 
-fn read_capacity(path: &Path) -> Option<u8> {
-    if let Some(capacity) = read_trimmed(&path.join("capacity")) {
+fn supply_names() -> Vec<String> {
+    let Ok(fd) = open(POWER_SUPPLY, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()) else {
+        return Vec::new();
+    };
+    let Ok(mut directory) = Dir::read_from(&fd) else {
+        return Vec::new();
+    };
+
+    let mut names = Vec::new();
+
+    while let Some(Ok(entry)) = directory.read() {
+        if let Ok(name) = entry.file_name().to_str() {
+            names.push(name.to_string());
+        }
+    }
+
+    names
+}
+
+fn read_capacity(directory: &str) -> Option<u8> {
+    if let Some(capacity) = read_trimmed(&format!("{directory}/capacity")) {
         return capacity.parse().ok();
     }
 
-    let energy_now: f64 = read_trimmed(&path.join("energy_now"))?.parse().ok()?;
-    let energy_full: f64 = read_trimmed(&path.join("energy_full"))?.parse().ok()?;
+    let energy_now: f64 = read_trimmed(&format!("{directory}/energy_now"))?.parse().ok()?;
+    let energy_full: f64 = read_trimmed(&format!("{directory}/energy_full"))?.parse().ok()?;
 
     Some((energy_now / energy_full * 100.0).round() as u8)
 }
 
-fn read_trimmed(path: &Path) -> Option<String> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    let trimmed = contents.trim();
+fn read_trimmed(path: &str) -> Option<String> {
+    let fd = open(path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).ok()?;
+    let mut buffer = [0u8; 128];
+    let count = read_fd(&fd, &mut buffer).ok()?;
+    let trimmed = core::str::from_utf8(&buffer[..count]).ok()?.trim();
 
     if trimmed.is_empty() {
         None

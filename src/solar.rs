@@ -1,3 +1,5 @@
+use core_maths::CoreFloat;
+
 pub const BUENOS_AIRES_LATITUDE: f64 = -34.6037;
 pub const BUENOS_AIRES_LONGITUDE: f64 = -58.3816;
 
@@ -36,7 +38,7 @@ struct SolarParameters {
 impl SolarParameters {
     fn at(day_of_year: u32, latitude: f64, longitude: f64) -> Self {
         let fractional_year =
-            2.0 * std::f64::consts::PI / 365.0 * (day_of_year as f64 - 1.0 + 0.5);
+            2.0 * core::f64::consts::PI / 365.0 * (day_of_year as f64 - 1.0 + 0.5);
 
         let declination = 0.006918 - 0.399912 * fractional_year.cos()
             + 0.070257 * fractional_year.sin()

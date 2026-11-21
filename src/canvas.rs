@@ -1,3 +1,5 @@
+use core_maths::CoreFloat;
+
 pub type Color = [u8; 3];
 
 #[derive(Clone, Copy)]

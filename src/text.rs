@@ -1,19 +1,21 @@
 use crate::canvas::{Canvas, Color};
+use alloc::vec::Vec;
+use core_maths::CoreFloat;
 use fontdue::{Font, FontSettings};
-use std::collections::HashMap;
 
 pub struct Text {
     font: Font,
-    glyphs: HashMap<GlyphKey, Glyph>,
+    glyphs: Vec<CachedGlyph>,
 }
 
-#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy)]
 struct GlyphKey {
     character: char,
     quantized_size: u32,
 }
 
-struct Glyph {
+struct CachedGlyph {
+    key: GlyphKey,
     metrics: fontdue::Metrics,
     coverage: Vec<u8>,
 }
@@ -24,7 +26,7 @@ impl Text {
 
         Self {
             font,
-            glyphs: HashMap::new(),
+            glyphs: Vec::new(),
         }
     }
 
@@ -77,35 +79,46 @@ impl Text {
             let glyph = self.glyph(character, size);
             let bitmap_top = baseline - (glyph.metrics.ymin + glyph.metrics.height as i32) as f32;
             let bitmap_left = pen + glyph.metrics.xmin as f32;
+            let width = glyph.metrics.width;
+            let height = glyph.metrics.height;
+            let advance = glyph.metrics.advance_width;
+            let coverage = &glyph.coverage;
 
-            for row in 0..glyph.metrics.height {
-                for column in 0..glyph.metrics.width {
-                    let coverage = glyph.coverage[row * glyph.metrics.width + column];
+            for row in 0..height {
+                for column in 0..width {
+                    let alpha = coverage[row * width + column];
 
-                    if coverage > 0 {
+                    if alpha > 0 {
                         let x = bitmap_left.round() as i32 + column as i32;
                         let y = bitmap_top.round() as i32 + row as i32;
-                        canvas.blend(x, y, color, coverage as f32 / 255.0);
+                        canvas.blend(x, y, color, alpha as f32 / 255.0);
                     }
                 }
             }
 
-            pen += glyph.metrics.advance_width + letter_spacing;
+            pen += advance + letter_spacing;
         }
 
         pen - letter_spacing
     }
 
-    fn glyph(&mut self, character: char, size: f32) -> &Glyph {
+    fn glyph(&mut self, character: char, size: f32) -> &CachedGlyph {
         let key = GlyphKey {
             character,
             quantized_size: (size * 16.0) as u32,
         };
 
-        self.glyphs.entry(key).or_insert_with(|| {
-            let (metrics, coverage) = self.font.rasterize(character, size);
+        let existing = self.glyphs.iter().position(|cached| cached.key == key);
 
-            Glyph { metrics, coverage }
-        })
+        let index = match existing {
+            Some(index) => index,
+            None => {
+                let (metrics, coverage) = self.font.rasterize(character, size);
+                self.glyphs.push(CachedGlyph { key, metrics, coverage });
+                self.glyphs.len() - 1
+            }
+        };
+
+        &self.glyphs[index]
     }
 }

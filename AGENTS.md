@@ -1,63 +1,94 @@
 # daylight-clock
 
-Native Wayland replacement for a single-page web clock. Shows a clock for Buenos Aires, a background that follows the real civil dawn / sunrise / sunset / civil dusk cycle, and the battery percentage in a corner. Clicking the power button offers confirm and power-off pages.
+Native Wayland clock for Buenos Aires: time, a background that follows the real civil dawn / sunrise / sunset / civil dusk cycle, and a battery widget with a charging bolt. Clicking the power button opens confirm and power-off pages.
 
-Single Rust binary, no build system beyond Cargo. No dependencies beyond `wayland-client`, `wayland-protocols`, `memmap2`, `fontdue`, `rustix`.
+Single libc-free static Rust binary: `#![no_std]`, custom `_start`, own allocator, no dynamic loader, no libc, no CRT. Only raw syscalls via `rustix` and two local crates.
 
 ## Commands
 
 - Build: `cargo build --release`
-- Run: `cargo run --release` (requires a Wayland compositor; exits with an error otherwise)
-- No tests exist. Do not add a test suite unless explicitly asked; verify changes by running the binary.
+- Run: `./target/release/daylight-clock` (requires a Wayland compositor)
+- Verify libc-free: `file target/release/daylight-clock` → `statically linked`; `readelf -d` → no dynamic section; `readelf -sW ... | grep UND` → empty.
+- No tests exist. Verify changes by running the binary.
 
-## Files
+## Layout
 
-- `src/main.rs` — Wayland client, event loop, layer surfaces, shm buffers, cursor, input dispatch.
-- `src/scene.rs` — all layout and painting of the clock page, power pages and battery widget.
+- `src/main.rs` — allocator, entry point, libc shims, Wayland event loop, layers, buffers, cursor, input.
+- `src/scene.rs` — layout and painting of clock pages and battery widget, daylight colours, bolt drawing.
 - `src/canvas.rs` — software raster surface: `Color`, `Rect`, `blend`, antialiased `fill_shaped`.
-- `src/text.rs` — fontdue wrapper with a glyph raster cache keyed by character plus quantized size.
-- `src/civil.rs` — civil time conversion, hardcoded UTC-3 offset, `format_clock`, day-of-year.
-- `src/solar.rs` — NOAA-style solar position math, hardcoded Buenos Aires latitude / longitude.
-- `src/battery.rs` — reads `/sys/class/power_supply`, picks the `System`-scope battery (skips absent and peripheral `Device` batteries), prefers `capacity`, falls back to `energy_now/energy_full`. Charging means external power is connected: `Charging`, `Not charging` and `Full` count as charging, `Discharging` does not; `Unknown` or missing status falls back to any supply with `online == 1`. `battery::Events` is a nonblocking netlink `KOBJECT_UEVENT` listener that filters `SUBSYSTEM=power_supply`, so plug, unplug and level changes are picked up within one 50 ms loop iteration.
-- `assets/DejaVuSansMono-subset.ttf` — glyph subset embedded via `include_bytes!`. Adding new characters to any rendered string requires regenerating this subset; otherwise glyphs render blank.
+- `src/text.rs` — fontdue wrapper, glyph cache as a `Vec` (no `HashMap`).
+- `src/civil.rs` — civil time from `clock_gettime`, UTC-3 offset, `format_clock`, monotonic clock helper.
+- `src/solar.rs` — NOAA-style solar position for hardcoded Buenos Aires coordinates.
+- `src/battery.rs` — sysfs battery reader plus netlink `KOBJECT_UEVENT` listener.
+- `crates/wayland-lite` — clean-room `no_std` Wayland client subset (`wire`, `protocol`, `client`) with its own `README.md`.
+- `crates/lean-mmap` — clean-room `no_std` `memmap2` replacement (`MmapMut`, `madvise`).
+- `assets/DejaVuSansMono-subset.ttf` — embedded glyph subset. New characters in rendered strings require regenerating it.
+- `battery-bolt.svg` — standalone design asset, not loaded by the build.
 - `index.html` — legacy web version, kept as an archive. Do not modify or delete it.
 
-## Architecture
+## Link and entry
 
-One parent `wl_surface` holds the background and is the toplevel. Child `wl_subsurface`s hold content (clock, buttons) and the battery widget, so each can be repainted independently. The parent is fullscreen, `Xrgb8888`; the cursor is a custom `Argb8888` buffer.
+`build.rs` passes `-nostartfiles -nostdlib -static -no-pie -Wl,--gc-sections` to the linker. `main.rs` defines:
 
-Buffers are single shm buffers per layer, created from a memfd, with a `busy` flag cleared on `wl_buffer::release`. Each buffer carries a numeric `slot` (dispatch user data) that identifies which layer to un-busy:
+- `_start` as a naked function that aligns the stack and calls `rust_entry`.
+- `rust_entry`: initialises the heap, then `run()`.
+- `run`: connect, roundtrip, `App::start`, then a loop of `flush`, `poll` (50 ms), `read`, drain events, `tick`, `render`.
+- A global allocator: `linked_list_allocator::LockedHeap` over a 4 MiB anonymous mapping.
+- `#[panic_handler]` that writes a message to stderr and calls `exit_group(101)`.
+- `#[no_mangle]` shims for `memcpy`, `memmove`, `memset`, `bcmp`, `strlen`, `rust_eh_personality`, `_Unwind_Resume`. They are volatile byte loops on purpose: a compiler-recognised loop would lower back into a call to the same symbol.
 
-- `CURSOR_SLOT` 1000
-- `BACKGROUND_SLOT` 2000
-- `CONTENT_SLOT` 3000
-- `BATTERY_SLOT` 4000
+Do not introduce `std`, `libc`, `wayland-client`, `wayland-protocols`, or `memmap2`. Do not add a `std`-only dependency: it will fail to link or silently drag libc back in.
 
-Add a new buffer only by giving it a fresh slot constant and extending `release_slot`.
+## Wayland model
 
-The frame loop is a manual `poll` with a 50 ms timeout, then `dispatch_pending`, then `tick`, then `render`. Rendering is dirty-flag driven: `background_dirty`, `content_dirty`, `battery_dirty`. A frame callback gates new paints; if a buffer is still busy the paint is skipped and the dirty flag stays set.
+`wayland-lite::Client` owns the socket, object table, globals and a decoded event queue. Handles are `Copy` newtypes over object ids. Requests are methods on `Client`; events arrive as `wayland_lite::Event`.
 
-Coordinates: layout math runs in logical pixels; a `scale` factor comes from `wl_output` and is applied when positioning subsurfaces and when rasterizing. `snap_to_scale` rounds sizes up to whole device pixels. `Layer::set_position` takes logical coordinates.
+Parent `wl_surface` holds the background and is the `xdg_toplevel`. Two child `wl_subsurface`s hold content (clock, buttons) and the battery widget, so each repaints independently. Parent is fullscreen, `Xrgb8888`; the cursor is a custom `Argb8888` buffer.
 
-Content is centered in the toplevel; the battery layer sits at the bottom-left and is unmapped while no battery exists.
+Wayland fixed-point values are 24.8 (`wl_fixed_t`), so `Encoder::fixed`/`Decoder::fixed` scale by 256, not 65536. Pointer coordinates are surface-local; `track_pointer` converts parent-relative coordinates by subtracting the content subsurface origin.
 
-Text is drawn with `mix-blend-mode: difference` semantics emulated by `canvas::difference`: objects are cleared to the current background colour and drawn with the difference ink so images and text invert against the animated background.
+Wayland file descriptors travel only in SCM_RIGHTS ancillary data; they occupy no words in a message body. `wl_shm.create_pool` is therefore `new_id, size`, and `sendmsg` uses `MSG_NOSIGNAL` so a dead compositor surfaces as `EPIPE` instead of killing the process.
 
-Background colour is a pure function of `SunTimes` and milliseconds into the day: black at night, linear fade across civil dawn to sunrise, 6500 K white through the day, fade back across sunset to civil dusk. Ink colour is the complement, so it never needs a separate palette.
+Wayland fixed-point values are 24.8 (`wl_fixed_t`), so `Encoder::fixed`/`Decoder::fixed` scale by 256, not 65536. Pointer coordinates are surface-local; `track_pointer` converts parent-relative coordinates by subtracting the content subsurface origin.
 
-Input: the parent surface has a fully covering input region so the whole toplevel is interactive; `wl_pointer` motion is tracked only over the content subsurface, and button rects are resolved by `scene::action_at` in content-local logical coordinates.
+Wayland file descriptors travel only in SCM_RIGHTS ancillary data; they occupy no words in a message body. `wl_shm.create_pool` is therefore `new_id, size`, and `sendmsg` uses `MSG_NOSIGNAL` so a dead compositor surfaces as `EPIPE` instead of killing the process.
+
+Buffers are single shm buffers per layer from a memfd, with a `busy` flag cleared by `Event::BufferRelease`. `lean-mmap` maps them. After every commit the mapping is `madvise(DONTNEED)`-ed to keep RSS down. `Buffers` keeps the `wl_shm_pool` alive; replaced buffers are intentionally not destroyed, matching the original behaviour.
+
+Sizing: `scene::content_size` and `scene::battery_size` return device pixels (they apply `scale` and snap to it); `place_layers` divides by `scale` to get logical subsurface positions. Keep layout, drawing and hit testing derived from the same functions.
+
+Rendering is dirty-flag driven (`background_dirty`, `content_dirty`, `battery_dirty`) and gated by a `wl_callback` frame callback and buffer availability.
+
+Colours: background is a pure function of sunset/sunrise and milliseconds into the day (black at night, 6500 K white by day, linear fades through twilight). Ink is the channel-wise complement of the background (`canvas::difference`), so text and icons invert against the animated background.
+
+Input: the parent input region covers the toplevel; pointer motion is tracked only over the content subsurface; button rectangles are resolved by `scene::action_at` in content-local logical coordinates.
+
+## Environment-specific notes
+
+- `rustix` is pinned to `=1.1.6` because `execve`/`exit_group` live in the hidden, randomly named module `runtime_448b8ad740e2a26f`. Bumping rustix means updating that import path.
+- `fontdue` must stay on `default-features = false, features = ["hashbrown"]`; that combination is what enables its `no_std` path.
+- Float transcendentals come from `core_maths::CoreFloat`; import the trait in every module that calls `sin`, `cos`, `sqrt`, `powi`, `round`, etc.
+- Text cache is a `Vec`, not a `HashMap`, to avoid another dependency.
+- Charging detection: pick the `System`-scope battery, skip absent and peripheral `Device` batteries, prefer `capacity` then `energy_now/energy_full`. `Charging`, `Not charging` and `Full` all mean plugged in; `Discharging` does not; `Unknown`/missing falls back to any supply with `online == 1`.
+- Battery state is event driven: `battery::Events` reads power-supply uevents from a nonblocking netlink `KOBJECT_UEVENT` socket filtered on `SUBSYSTEM=power_supply`, with a 2 s poll as fallback.
+- inotify on `/sys/class/power_supply` does not work: the power supply core only emits kobject uevents and never calls `kernfs_notify`, so fsnotify never fires.
+- Power-off `execve`s `/usr/bin/systemctl`, `/bin/systemctl`, or `/usr/sbin/systemctl` with `poweroff` 750 ms after confirmation, so the "powering off" dots are visible.
+
+## Verification without a session
+
+A headless compositor is enough to exercise the whole client path:
+
+```
+mkdir -p /tmp/xdg && chmod 700 /tmp/xdg
+XDG_RUNTIME_DIR=/tmp/xdg dbus-run-session -- mutter --headless --no-x11 --virtual-monitor 1920x1080 --wayland-display=wayland-debug &
+XDG_RUNTIME_DIR=/tmp/xdg WAYLAND_DISPLAY=wayland-debug timeout 10 ./target/release/daylight-clock
+```
+
+Without `--virtual-monitor` mutter never sends `xdg_toplevel.configure`. A healthy run stays alive until `timeout` kills it (exit 124), with no stderr output and no `WL: error in client communication` in mutter's log.
 
 ## Conventions
 
-- Code style: self-documenting names, no comments. Match the existing module layout and spacing; do not reformat untouched code.
-- No defensive fallbacks for programmer errors. Missing Wayland globals and unusable font data panic with a clear message on purpose.
-- Layout constants live at the top of `scene.rs`; changing a font size or padding usually requires adjusting the derived sizes in `content_size` and `battery_size` together, because the surfaces are sized to exact content bounds.
-- Sizes are recomputed from the same functions that draw, so layout and hit-testing stay in agreement. Keep that property: any new widget needs both a size function and a matching draw function, and hit testing must use the same origin math.
-- Battery state is event driven: `battery::Events` wakes the re-read on any power supply uevent, with a 30 s poll as fallback. Power-off runs `systemctl poweroff` 750 ms after confirmation so the "powering off" dots are visible.
-
-## Known state
-
-- `Cargo.toml` and `src/main.rs` contain uncommitted work: `wayland-client` switched to `default-features = false` and buffers are `madvise(DONTNEED)`-ed after commit to keep RSS low. Preserve that behaviour.
-- inotify on `/sys/class/power_supply` does not work: the power supply core only emits kobject uevents and never calls `kernfs_notify`, so fsnotify never fires for `status` or `capacity`. Charging updates come from the netlink uevent listener instead.
-- `.vite/` is an untracked leftover from the web version and is not referenced by the Rust build.
-- Application identity and window title are `daylight-clock` / `Buenos Aires daylight cycle`.
+- Self-documenting names, no comments, no reformatting of untouched code.
+- No defensive fallbacks for programmer errors: missing globals, font data and allocator failures panic with a clear message.
+- No tests, no examples.
+- Layout constants live at the top of `scene.rs`; a widget needs a size function and a matching draw function, and hit testing must use the same origin math.
