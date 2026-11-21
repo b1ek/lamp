@@ -20,6 +20,7 @@ Single libc-free static Rust binary: `#![no_std]`, custom `_start`, own allocato
 - `src/civil.rs` — civil time from `clock_gettime`, UTC-3 offset, `format_clock`, monotonic clock helper.
 - `src/solar.rs` — NOAA-style solar position for hardcoded Buenos Aires coordinates.
 - `src/battery.rs` — sysfs battery reader plus netlink `KOBJECT_UEVENT` listener.
+- `build.rs` — linker flags only.
 - `crates/wayland-lite` — clean-room `no_std` Wayland client subset (`wire`, `protocol`, `client`) with its own `README.md`.
 - `crates/lean-mmap` — clean-room `no_std` `memmap2` replacement (`MmapMut`, `madvise`).
 - `assets/DejaVuSansMono-subset.ttf` — embedded glyph subset. New characters in rendered strings require regenerating it.
@@ -33,8 +34,8 @@ Single libc-free static Rust binary: `#![no_std]`, custom `_start`, own allocato
 - `_start` as a naked function that aligns the stack and calls `rust_entry`.
 - `rust_entry`: initialises the heap, then `run()`.
 - `run`: connect, roundtrip, `App::start`, then a loop of `flush`, `poll` (50 ms), `read`, drain events, `tick`, `render`.
-- A global allocator: `linked_list_allocator::LockedHeap` over a 4 MiB anonymous mapping.
-- `#[panic_handler]` that writes a message to stderr and calls `exit_group(101)`.
+- A global allocator: `linked_list_allocator::LockedHeap` over a 4 MiB anonymous mapping, marked `MADV_NOHUGEPAGE` because one THP otherwise adds 2 MiB of RSS for a few hundred KiB of real heap use.
+- `#[panic_handler]` that formats `PanicInfo::message()` plus the source location through a fixed 512-byte stack writer, then calls `exit_group(101)`. Do not use the deprecated `PanicInfo::payload`.
 - `#[no_mangle]` shims for `memcpy`, `memmove`, `memset`, `bcmp`, `strlen`, `rust_eh_personality`, `_Unwind_Resume`. They are volatile byte loops on purpose: a compiler-recognised loop would lower back into a call to the same symbol.
 
 Do not introduce `std`, `libc`, `wayland-client`, `wayland-protocols`, or `memmap2`. Do not add a `std`-only dependency: it will fail to link or silently drag libc back in.
@@ -44,10 +45,6 @@ Do not introduce `std`, `libc`, `wayland-client`, `wayland-protocols`, or `memma
 `wayland-lite::Client` owns the socket, object table, globals and a decoded event queue. Handles are `Copy` newtypes over object ids. Requests are methods on `Client`; events arrive as `wayland_lite::Event`.
 
 Parent `wl_surface` holds the background and is the `xdg_toplevel`. Two child `wl_subsurface`s hold content (clock, buttons) and the battery widget, so each repaints independently. Parent is fullscreen, `Xrgb8888`; the cursor is a custom `Argb8888` buffer.
-
-Wayland fixed-point values are 24.8 (`wl_fixed_t`), so `Encoder::fixed`/`Decoder::fixed` scale by 256, not 65536. Pointer coordinates are surface-local; `track_pointer` converts parent-relative coordinates by subtracting the content subsurface origin.
-
-Wayland file descriptors travel only in SCM_RIGHTS ancillary data; they occupy no words in a message body. `wl_shm.create_pool` is therefore `new_id, size`, and `sendmsg` uses `MSG_NOSIGNAL` so a dead compositor surfaces as `EPIPE` instead of killing the process.
 
 Wayland fixed-point values are 24.8 (`wl_fixed_t`), so `Encoder::fixed`/`Decoder::fixed` scale by 256, not 65536. Pointer coordinates are surface-local; `track_pointer` converts parent-relative coordinates by subtracting the content subsurface origin.
 
@@ -74,6 +71,14 @@ Input: the parent input region covers the toplevel; pointer motion is tracked on
 - inotify on `/sys/class/power_supply` does not work: the power supply core only emits kobject uevents and never calls `kernfs_notify`, so fsnotify never fires.
 - Power-off `execve`s `/usr/bin/systemctl`, `/bin/systemctl`, or `/usr/sbin/systemctl` with `poweroff` 750 ms after confirmation, so the "powering off" dots are visible.
 
+## Size and memory
+
+- Stripped binary: ~237 KB. `.text` ~168 KB, `.rodata` ~35 KB, `.eh_frame` + header ~26 KB.
+- Largest code blocks: app ~75 KB (LTO merges scene/render/cursor into `run`), fontdue + ttf-parser ~23 KB, float parse/format from panic payload formatting ~29 KB, wayland-lite ~14 KB, fmt ~11 KB, libm ~7 KB.
+- Idle RSS: ~472 KB. Heap mapping is 4 MiB reserved, ~132 KB touched; stack ~84 KB; binary ~244 KB; shm mappings are `DONTNEED`-ed and keep ~4 KB.
+- Measured dead ends: `lld --icf=all` saves ~2.4 KB; `opt-level = "s"` and `force-unwind-tables=no` increase size; replacing panic formatting with exit-on-error shrank the binary to 187 KB but was reverted (behavioural regression), so keep the current panic path.
+- Pointer/viewport fixed-point, fd passing and per-frame buffer reuse are already minimal; RGB565 or a 1-bit mask would change the protocol/quality for little gain.
+
 ## Verification without a session
 
 A headless compositor is enough to exercise the whole client path:
@@ -85,6 +90,8 @@ XDG_RUNTIME_DIR=/tmp/xdg WAYLAND_DISPLAY=wayland-debug timeout 10 ./target/relea
 ```
 
 Without `--virtual-monitor` mutter never sends `xdg_toplevel.configure`. A healthy run stays alive until `timeout` kills it (exit 124), with no stderr output and no `WL: error in client communication` in mutter's log.
+
+Input can be exercised headlessly through mutter's `org.gnome.Mutter.RemoteDesktop` D-Bus API: create a session, `Start`, `NotifyPointerMotionRelative`, `NotifyPointerButton(272, true/false)`; BTN_LEFT is 272.
 
 ## Conventions
 

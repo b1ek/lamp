@@ -20,7 +20,7 @@ use linked_list_allocator::LockedHeap;
 use rustix::event::{poll, PollFd, PollFlags};
 use rustix::fd::AsFd;
 use rustix::fs::{ftruncate, memfd_create, MemfdFlags};
-use rustix::mm::{mmap_anonymous, MapFlags, ProtFlags};
+use rustix::mm::{madvise, mmap_anonymous, Advice, MapFlags, ProtFlags};
 use rustix::runtime_448b8ad740e2a26f::{execve, exit_group};
 use rustix::time::Timespec;
 use scene::{Action, Display, Page};
@@ -70,6 +70,8 @@ fn init_allocator() {
         )
     }
     .expect("heap mapping is required");
+
+    unsafe { madvise(heap, HEAP_SIZE, Advice::LinuxNoHugepage) }.expect("heap advice failed");
 
     unsafe { ALLOCATOR.lock().init(heap.cast::<u8>(), HEAP_SIZE) };
 }
@@ -1065,38 +1067,49 @@ fn power_off() -> ! {
     exit_group(1)
 }
 
-struct StackMessage {
+struct PanicMessage {
     bytes: [u8; 512],
     length: usize,
 }
 
-impl StackMessage {
+impl PanicMessage {
     fn new() -> Self {
         Self {
             bytes: [0; 512],
             length: 0,
         }
     }
-}
 
-impl core::fmt::Write for StackMessage {
-    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+    fn push(&mut self, text: &[u8]) {
         let remaining = self.bytes.len() - self.length;
         let take = text.len().min(remaining);
 
-        self.bytes[self.length..self.length + take].copy_from_slice(&text.as_bytes()[..take]);
+        self.bytes[self.length..self.length + take].copy_from_slice(&text[..take]);
         self.length += take;
+    }
+}
 
+impl core::fmt::Write for PanicMessage {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        self.push(text.as_bytes());
         Ok(())
     }
 }
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    let mut message = StackMessage::new();
-    let _ = write!(&mut message, "daylight-clock panic: {info}\n");
+    let mut message = PanicMessage::new();
+    let _ = write!(&mut message, "daylight-clock panic: {}", info.message());
+
+    if let Some(location) = info.location() {
+        let _ = write!(&mut message, " at {}:{}", location.file(), location.line());
+    }
+
+    message.push(b"\n");
+
     unsafe {
         let _ = rustix::io::write(rustix::stdio::stderr(), &message.bytes[..message.length]);
     }
+
     exit_group(101)
 }
