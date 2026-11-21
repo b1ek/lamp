@@ -23,6 +23,10 @@ const BATTERY_BODY_UNITS: f32 = 5.2;
 const BATTERY_NUB_GAP: f32 = 2.0;
 const BATTERY_NUB_WIDTH: f32 = 13.0;
 
+const BOLT_WIDTH_RATIO: f32 = 0.6;
+const BOLT_HEIGHT_RATIO: f32 = 1.0;
+const BOLT_HALO_UNITS: f32 = 0.45;
+
 const CONTENT_PADDING: f32 = 2.0;
 
 #[derive(PartialEq, Clone, Copy)]
@@ -50,6 +54,7 @@ pub struct Display {
     pub time: String,
     pub dots: usize,
     pub battery: Option<u8>,
+    pub charging: bool,
 }
 
 pub struct Button {
@@ -186,7 +191,7 @@ pub fn draw_battery(
         container.width / BATTERY_ICON_ASPECT,
     );
 
-    draw_battery_icon(canvas, icon, percentage, ink);
+    draw_battery_icon(canvas, icon, percentage, display.charging, ink, background);
 
     let percentage_font = BATTERY_PERCENTAGE_FONT * scale;
     let label = format!("{}%", percentage);
@@ -376,7 +381,7 @@ fn draw_button(canvas: &mut Canvas, button: &Button, row_top: f32, pen: f32, sca
     }
 }
 
-fn draw_battery_icon(canvas: &mut Canvas, icon: Rect, percentage: u8, ink: Color) {
+fn draw_battery_icon(canvas: &mut Canvas, icon: Rect, percentage: u8, charging: bool, ink: Color, background: Color) {
     let unit = icon.height / 3.175;
     let body = Rect::new(icon.x, icon.y, BATTERY_BODY_UNITS * unit, 3.175 * unit);
     let nub = Rect::new(
@@ -406,6 +411,47 @@ fn draw_battery_icon(canvas: &mut Canvas, icon: Rect, percentage: u8, ink: Color
         ink,
         |x, y| inside_round_rect(x, y, nub, 0.35 * unit),
     );
+
+    println!("{charging}");
+
+    if charging {
+        draw_charge_bolt(canvas, body, unit, ink, background);
+    }
+}
+
+fn draw_charge_bolt(canvas: &mut Canvas, body: Rect, unit: f32, ink: Color, background: Color) {
+    let outline = Rect::new(
+        body.x + 32.0,
+        body.y,
+        body.width * BOLT_WIDTH_RATIO,
+        body.height * BOLT_HEIGHT_RATIO,
+    );
+    let points = bolt_points(outline);
+    let halo = BOLT_HALO_UNITS * unit;
+    let bounds = Rect::new(
+        outline.x - halo,
+        outline.y - halo,
+        outline.width + halo * 2.0,
+        outline.height + halo * 2.0,
+    );
+
+    canvas.fill_shaped(bounds, background, |x, y| {
+        inside_polygon(x, y, &points) || distance_to_polygon(x, y, &points) <= halo
+    });
+
+    canvas.fill_shaped(bounds, ink, |x, y| inside_polygon(x, y, &points));
+}
+
+fn bolt_points(rect: Rect) -> [(f32, f32); 6] {
+    [
+        (0.60, 0.00),
+        (0.10, 0.56),
+        (0.44, 0.56),
+        (0.36, 1.00),
+        (0.90, 0.42),
+        (0.54, 0.42),
+    ]
+    .map(|(x, y)| (rect.x + x * rect.width, rect.y + y * rect.height))
 }
 
 fn draw_power_icon(canvas: &mut Canvas, icon: Rect, ink: Color) {
@@ -453,6 +499,39 @@ fn draw_back_icon(canvas: &mut Canvas, icon: Rect, ink: Color) {
 fn angular_distance(first: f32, second: f32) -> f32 {
     let difference = (first - second).abs() % std::f32::consts::TAU;
     difference.min(std::f32::consts::TAU - difference)
+}
+
+fn inside_polygon(x: f32, y: f32, points: &[(f32, f32)]) -> bool {
+    let mut inside = false;
+    let mut previous = points.len() - 1;
+
+    for current in 0..points.len() {
+        let (current_x, current_y) = points[current];
+        let (previous_x, previous_y) = points[previous];
+
+        let crosses = (current_y > y) != (previous_y > y);
+        let intersection_x = (previous_x - current_x) * (y - current_y) / (previous_y - current_y) + current_x;
+
+        if crosses && x < intersection_x {
+            inside = !inside;
+        }
+
+        previous = current;
+    }
+
+    inside
+}
+
+fn distance_to_polygon(x: f32, y: f32, points: &[(f32, f32)]) -> f32 {
+    let mut distance = f32::INFINITY;
+
+    for index in 0..points.len() {
+        let start = points[index];
+        let end = points[(index + 1) % points.len()];
+        distance = distance.min(distance_to_segment(x, y, start, end));
+    }
+
+    distance
 }
 
 fn distance_to_segment(x: f32, y: f32, start: (f32, f32), end: (f32, f32)) -> f32 {

@@ -169,7 +169,7 @@ impl App {
         let sun = solar::for_date(local.year, local.month, local.day);
         let milliseconds_into_day = local.milliseconds_into_day as f64;
         let background_color = scene::background_at(&sun, milliseconds_into_day);
-        let battery_percentage = battery::read().map(|battery| battery.percentage);
+        let battery_state = battery::read();
 
         Self {
             queue_handle: queue_handle.clone(),
@@ -209,7 +209,8 @@ impl App {
                 page: Page::Clock,
                 time: civil::format_clock(&local),
                 dots: 0,
-                battery: battery_percentage,
+                battery: battery_state.as_ref().map(|battery| battery.percentage),
+                charging: battery_state.as_ref().map_or(false, |battery| battery.charging),
             },
             sun,
             sun_date: (local.year, local.month, local.day),
@@ -256,10 +257,13 @@ impl App {
         }
 
         if self.battery_checked.elapsed() >= BATTERY_REFRESH_INTERVAL {
-            let percentage = battery::read().map(|battery| battery.percentage);
+            let state = battery::read();
+            let percentage = state.as_ref().map(|battery| battery.percentage);
+            let charging = state.as_ref().map_or(false, |battery| battery.charging);
 
-            if percentage != self.display.battery {
+            if percentage != self.display.battery || charging != self.display.charging {
                 self.display.battery = percentage;
+                self.display.charging = charging;
                 self.battery_dirty = true;
             }
 

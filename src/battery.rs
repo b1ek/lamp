@@ -2,6 +2,7 @@ use std::path::Path;
 
 pub struct Battery {
     pub percentage: u8,
+    pub charging: bool,
 }
 
 pub fn read() -> Option<Battery> {
@@ -14,10 +15,17 @@ pub fn read() -> Option<Battery> {
             continue;
         }
 
-        return read_capacity(&path).map(|percentage| Battery { percentage });
+        return read_capacity(&path).map(|percentage| Battery {
+            percentage,
+            charging: is_charging(&path),
+        });
     }
 
     None
+}
+
+fn is_charging(_path: &Path) -> bool {
+    true
 }
 
 fn read_capacity(path: &Path) -> Option<u8> {
