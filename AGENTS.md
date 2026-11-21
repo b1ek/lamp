@@ -50,9 +50,13 @@ Wayland fixed-point values are 24.8 (`wl_fixed_t`), so `Encoder::fixed`/`Decoder
 
 Wayland file descriptors travel only in SCM_RIGHTS ancillary data; they occupy no words in a message body. `wl_shm.create_pool` is therefore `new_id, size`, and `sendmsg` uses `MSG_NOSIGNAL` so a dead compositor surfaces as `EPIPE` instead of killing the process.
 
+`release_buffer` checks every layer independently. Do not write it as an `else if` chain: a release for the battery buffer never reached its branch while the content layer had a buffer, so the battery stayed busy forever and stopped repainting.
+
 Buffers are single shm buffers per layer from a memfd, with a `busy` flag cleared by `Event::BufferRelease`. `lean-mmap` maps them. After every commit the mapping is `madvise(DONTNEED)`-ed to keep RSS down. `Buffers` keeps the `wl_shm_pool` alive; replaced buffers are intentionally not destroyed, matching the original behaviour.
 
 Sizing: `scene::content_size` and `scene::battery_size` return device pixels (they apply `scale` and snap to it); `place_layers` divides by `scale` to get logical subsurface positions. Keep layout, drawing and hit testing derived from the same functions.
+
+Configure handling: `wl_output.mode / wl_output.scale` is not the logical window size under fractional scaling (2880x1800 at 125% gives a 2304x1440 toplevel). `set_scale` therefore only updates buffer scales and re-places layers; it must not set `configure_pending`. The first frame is deferred until a real `xdg_toplevel.configure` arrives, otherwise the window renders one frame at the wrong size before the configure lands.
 
 Rendering is dirty-flag driven (`background_dirty`, `content_dirty`, `battery_dirty`) and gated by a `wl_callback` frame callback and buffer availability.
 
