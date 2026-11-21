@@ -605,6 +605,7 @@ impl Layer {
         self.surface.commit();
 
         buffer.busy = true;
+        buffer.drop_resident_pages();
         self.mapped = true;
 
         true
@@ -632,6 +633,7 @@ fn paint_background(
     surface.attach(Some(&buffer.buffer), 0, 0);
     surface.damage_buffer(0, 0, 1, 1);
     buffer.busy = true;
+    buffer.drop_resident_pages();
 
     true
 }
@@ -851,6 +853,17 @@ impl Buffers {
             width,
             height,
         }
+    }
+
+    fn drop_resident_pages(&mut self) {
+        unsafe {
+            rustix::mm::madvise(
+                self.mapping.as_mut_ptr().cast(),
+                self.mapping.len(),
+                rustix::mm::Advice::LinuxDontNeed,
+            )
+        }
+        .unwrap();
     }
 
     fn pixels(&mut self) -> &mut [u32] {
