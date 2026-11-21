@@ -79,6 +79,7 @@ fn init_allocator() {
 fn run() -> ! {
     let mut client = Client::connect().expect("wayland compositor is required");
     client.roundtrip().expect("wayland registry roundtrip failed");
+
     let mut app = App::start(&mut client);
 
     loop {
@@ -335,7 +336,9 @@ impl App {
             Event::OutputMode { width, height, .. } => {
                 self.output_size = Some((width as u32, height as u32));
             }
-            Event::OutputScale { factor, .. } => self.set_scale(client, factor),
+            Event::OutputScale { factor, .. } => {
+                self.set_scale(client, factor);
+            }
             Event::DisplayError { object_id, interface, code, message } => panic!(
                 "wayland display error: object {object_id} interface {interface:?} code {code}: {message}"
             ),
@@ -423,12 +426,19 @@ impl App {
     fn apply_configure(&mut self, client: &mut Client) {
         self.configure_pending = false;
 
+
         let logical_size = match self.requested_size {
             Some((width, height)) if width > 0 && height > 0 => (width as f32, height as f32),
-            _ => match self.output_size {
+            Some(_) if !self.configured => match self.output_size {
                 Some((width, height)) => (width as f32 / self.scale as f32, height as f32 / self.scale as f32),
-                None => self.logical_size,
+                None => {
+                    return;
+                }
             },
+            _ if self.configured => self.logical_size,
+            _ => {
+                return;
+            }
         };
 
         self.logical_size = logical_size;
@@ -471,7 +481,9 @@ impl App {
                 let origin = (0, (height - battery.1 / scale).round() as i32);
                 self.battery_layer.set_position(client, origin);
             }
-            None => self.battery_layer.unmap(client),
+            None => {
+                self.battery_layer.unmap(client);
+            }
         }
     }
 
@@ -624,19 +636,26 @@ impl App {
         self.cursor = Cursor::new(client, self.compositor, self.shm, scale);
         self.content.set_scale(client, scale);
         self.battery_layer.set_scale(client, scale);
-        self.configure_pending = true;
+        self.place_layers(client);
+        self.mark_all_dirty();
     }
 
     fn release_buffer(&mut self, buffer: WlBuffer) {
         if self.cursor.buffer.buffer == buffer {
             self.cursor.buffer.busy = false;
-        } else if self.background.buffer.buffer == buffer {
+        }
+
+        if self.background.buffer.buffer == buffer {
             self.background.buffer.busy = false;
-        } else if let Some(layer_buffer) = self.content.buffer.as_mut() {
+        }
+
+        if let Some(layer_buffer) = self.content.buffer.as_mut() {
             if layer_buffer.buffer == buffer {
                 layer_buffer.busy = false;
             }
-        } else if let Some(layer_buffer) = self.battery_layer.buffer.as_mut() {
+        }
+
+        if let Some(layer_buffer) = self.battery_layer.buffer.as_mut() {
             if layer_buffer.buffer == buffer {
                 layer_buffer.busy = false;
             }
@@ -736,6 +755,7 @@ impl Layer {
             return false;
         }
 
+
         {
             let pixels = buffer.pixels();
             paint(&mut Canvas::new(pixels, width, height));
@@ -764,6 +784,7 @@ fn paint_background(client: &mut Client, shm: WlShm, background: &mut Background
     if background.buffer.busy {
         return false;
     }
+
 
     if (background.buffer.width, background.buffer.height) != (1, 1) {
         background.buffer = Buffers::new(client, shm, 1, 1, ShmFormat::Xrgb8888);
@@ -808,6 +829,7 @@ impl Buffers {
         let buffer = client
             .shm_pool_create_buffer(pool, 0, width, height, stride, format)
             .expect("shm buffer creation failed");
+
 
         Self {
             _pool: pool,
